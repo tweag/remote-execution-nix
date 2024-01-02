@@ -5,9 +5,11 @@ edition = "2021"
 
 
 [dependencies]
+anyhow = { version = "1.0.79", features = ["backtrace"] }
 nix-remote = { path = "../../../nix-remote-rust" }
 prost = "0.12.3"
 prost-types = "0.12.3"
 ring = "0.17.7"
+serde = { version = "1.0.194", features = ["derive"] }
 tokio = { version = "1.35.0", features = ["rt-multi-thread", "macros"] }
 tonic = "0.10.2"
