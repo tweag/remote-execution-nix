@@ -1,0 +1,3 @@
+[workspace]
+members = ["generator", "crates/proxy"]
+resolver = "2"
