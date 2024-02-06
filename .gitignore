@@ -1,3 +1,4 @@
 /target
 generator/out
 generator/proto
+test-remote-store

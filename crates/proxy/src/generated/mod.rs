@@ -2,6 +2,9 @@ pub mod google {
     pub mod api {
         include!("google.api.rs");
     }
+    pub mod bytestream {
+        include!("google.bytestream.rs");
+    }
     pub mod longrunning {
         include!("google.longrunning.rs");
     }

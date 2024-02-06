@@ -9,7 +9,10 @@ fn main() {
         .out_dir("out")
         .compile_with_config(
             config,
-            &["build/bazel/remote/execution/v2/remote_execution.proto"],
+            &[
+                "build/bazel/remote/execution/v2/remote_execution.proto",
+                "google/bytestream/bytestream.proto",
+            ],
             &["proto/remote-apis-2.2.0", "proto/googleapis-master"],
         )
         .unwrap();

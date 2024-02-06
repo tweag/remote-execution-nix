@@ -28,6 +28,7 @@
             rust-toolchain
             cargo-expand
             protobuf
+            grpcurl
           ];
           
           shellHook = ''
