@@ -100,7 +100,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
     let mut blobs = Vec::new();
 
     fn convert_file_rec(file: &NarFile, acc: &mut Vec<Blob>) -> Digest {
-        let (blob, digest) = blob(file.contents.0.as_ref().to_owned());
+        let (blob, digest) = blob(file.contents.as_ref().to_owned());
         acc.push(blob);
         digest
     }
@@ -111,7 +111,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
         let mut directories = Vec::new();
         for entry in entries {
             // FIXME: proper error for non-utf8 names. The protocol apparently doesn't support non-utf8 names.
-            let name = String::from_utf8(entry.name.0.as_ref().to_owned()).unwrap();
+            let name = String::from_utf8(entry.name.as_ref().to_owned()).unwrap();
             match &entry.node {
                 Nar::Contents(file) => {
                     let digest = convert_file_rec(file, acc);
@@ -125,7 +125,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
                     files.push(node);
                 }
                 Nar::Target(sym) => {
-                    let target = String::from_utf8(sym.0.as_ref().to_owned()).unwrap();
+                    let target = String::from_utf8(sym.as_ref().to_owned()).unwrap();
                     let properties = default_properties(true);
                     let node = SymlinkNode {
                         name,
@@ -231,7 +231,7 @@ fn build_input_root(
                     _ => unreachable!(),
                 };
                 FileNode {
-                    name: String::from_utf8(f.0 .0.as_ref().to_owned())
+                    name: String::from_utf8(f.as_ref().to_owned())
                         .unwrap()
                         .strip_prefix("/nix/store/") // FIXME: look up the actual store path, and also adjust the directory tree building
                         .unwrap()
@@ -245,7 +245,7 @@ fn build_input_root(
         directories: dirs
             .into_iter()
             .map(|d| DirectoryNode {
-                name: String::from_utf8(d.0 .0.as_ref().to_owned())
+                name: String::from_utf8(d.as_ref().to_owned())
                     .unwrap()
                     .strip_prefix("/nix/store/") // FIXME: look up the actual store path, and also adjust the directory tree building
                     .unwrap()
