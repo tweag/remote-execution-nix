@@ -1,10 +1,10 @@
 // TODO:
-// - basic sending of the nar tree works, but we aren't streaming
-// - (bonus: pack small files into batch requests)
 // - to do the builds, we'll need to map nix store paths to digests so that we
 //   can fetch the filesystem trees; we have an innmemory version, but we may need to persist it into the AC
 // - read the BuildDerivation op and figure out how to build it
 // - remove leading /nix/store from uploaded files in build_input_root
+// - basic sending of the nar tree works, but we aren't streaming
+// - (bonus: pack small files into batch requests)
 
 mod generated;
 
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::hash;
 use std::io::{Cursor, Write};
 
+use futures::StreamExt;
 use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use generated::build::bazel::remote::execution::v2::{FileNode, NodeProperties};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -29,12 +30,14 @@ use serde::Serialize;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
+use crate::generated::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
 use crate::generated::build::bazel::remote::execution::v2::{
     batch_update_blobs_request::Request, BatchReadBlobsRequest, BatchUpdateBlobsRequest, Digest,
     FindMissingBlobsRequest,
 };
 use crate::generated::build::bazel::remote::execution::v2::{
-    Directory, DirectoryNode, SymlinkNode,
+    Action, Command, Directory, DirectoryNode, ExecuteOperationMetadata, ExecuteRequest,
+    ExecuteResponse, SymlinkNode,
 };
 use crate::generated::google::bytestream::WriteRequest;
 
@@ -295,7 +298,8 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await
         .unwrap();
-    let mut cas_client = ContentAddressableStorageClient::new(channel.clone());
+    //let mut cas_client = ContentAddressableStorageClient::new(channel.clone());
+    let mut exec_client = ExecutionClient::new(channel.clone());
     let mut bs_client = ByteStreamClient::new(channel);
     // TODO: put each of these mappings in the action cache
     let mut store_path_map = HashMap::new();
@@ -307,6 +311,25 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("got version {v}");
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
+
+    let cmd = Command {
+        arguments: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            // FIXME: build barn runs multiple executions in the same container! The /nix directory
+            // will be preserved between runs. Maybe chroot is more reliable?
+            "mv nix /; ls -R / > out.txt".to_owned(),
+        ],
+        environment_variables: vec![],
+        output_files: vec![],
+        output_directories: vec![],
+        output_paths: vec!["out.txt".to_owned()],
+        platform: None,
+        working_directory: "".to_owned(),
+        output_node_properties: vec![],
+    };
+    let (cmd_blob, cmd_digest) = blob(cmd.encode_to_vec());
+    upload_blob(&mut bs_client, cmd_blob).await?;
 
     while let Some(op) = nix.next_op()? {
         eprintln!("read op {op:?}");
@@ -343,7 +366,52 @@ async fn main() -> anyhow::Result<()> {
                 for blob in blobs {
                     upload_blob(&mut bs_client, blob).await?;
                 }
-                dbg!(input_digest);
+                dbg!(&input_digest);
+
+                let action = Action {
+                    command_digest: Some(cmd_digest),
+                    input_root_digest: Some(input_digest),
+                    timeout: None,
+                    do_not_cache: false,
+                    salt: "salt".as_bytes().to_owned(),
+                    platform: None,
+                };
+
+                let (action_blob, action_digest) = blob(action.encode_to_vec());
+                dbg!(&action_digest);
+                upload_blob(&mut bs_client, action_blob).await?;
+
+                let req = ExecuteRequest {
+                    instance_name: "fuse".to_string(),
+                    skip_cache_lookup: true,
+                    action_digest: Some(action_digest),
+                    execution_policy: None,
+                    results_cache_policy: None,
+                };
+
+                let mut results = exec_client.execute(req).await?.into_inner();
+                let mut last_op = None;
+                while let Some(op) = results.next().await.transpose()? {
+                    if op.done {
+                        last_op = op.result;
+                        break;
+                    }
+                }
+                match last_op.unwrap() {
+                    generated::google::longrunning::operation::Result::Error(e) => {
+                        panic!("{:?}", e)
+                    }
+                    generated::google::longrunning::operation::Result::Response(resp) => {
+                        assert_eq!(
+                            resp.type_url,
+                            "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse"
+                        );
+                        let resp = ExecuteResponse::decode(resp.value.as_ref())?;
+                        let action_result = resp.result.unwrap();
+                        dbg!(action_result);
+                    }
+                }
+
                 todo!()
             }
             _ => {
