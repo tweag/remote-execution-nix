@@ -8,7 +8,7 @@ edition = "2021"
 anyhow = { version = "1.0.79", features = ["backtrace"] }
 bincode = { version = "1.3.3", default-features = false }
 futures = "0.3.30"
-nix-remote = { path = "../../../nix-remote-rust" }
+nix-remote.workspace = true
 prost = "0.12.3"
 prost-types = "0.12.3"
 ring = "0.17.7"

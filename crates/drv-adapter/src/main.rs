@@ -20,7 +20,6 @@ fn main() -> anyhow::Result<()> {
         std::fs::remove_dir_all("/nix")?;
     }
     eprintln!("linking nix to /nix");
-    // TODO: this will fail if they're on different mount points
     std::os::unix::fs::symlink(cwd.join("nix"), "/nix")?;
 
     eprintln!("running cmd");
