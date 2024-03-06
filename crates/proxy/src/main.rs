@@ -1,3 +1,9 @@
+// Next time:
+// - Write the statically linked binary that sets up the env:
+//   https://github.com/NixOS/nix/blob/c3e9e3d0c34105caef4af2589b6195da23684336/src/libstore/build/local-derivation-goal.cc#L1096
+// - Include that binary in the input root for the CAS
+// - Run it
+
 // TODO:
 // - to do the builds, we'll need to map nix store paths to digests so that we
 //   can fetch the filesystem trees; we have an innmemory version, but we may need to persist it into the AC
@@ -5,6 +11,7 @@
 // - remove leading /nix/store from uploaded files in build_input_root
 // - basic sending of the nar tree works, but we aren't streaming
 // - (bonus: pack small files into batch requests)
+// - when uploading, check if the file is already there
 
 mod generated;
 
@@ -18,7 +25,7 @@ use generated::build::bazel::remote::execution::v2::{FileNode, NodeProperties};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
 use nix_remote::framed_data::FramedData;
 use nix_remote::nar::{NarDirectoryEntry, NarFile};
-use nix_remote::worker_op::{BuildDerivation, Stream, ValidPathInfo, WorkerOp};
+use nix_remote::worker_op::{BuildDerivation, Derivation, Stream, ValidPathInfo, WorkerOp};
 use nix_remote::{nar::Nar, NixProxy, NixReadExt, NixWriteExt};
 use nix_remote::{stderr, StorePath, StorePathSet, ValidPathInfoWithPath};
 use prost::Message;
@@ -88,6 +95,10 @@ fn default_properties(executable: bool) -> NodeProperties {
     }
 }
 
+fn blob_cloned(data: impl AsRef<[u8]>) -> (Blob, Digest) {
+    blob(data.as_ref().to_owned())
+}
+
 fn blob(data: Vec<u8>) -> (Blob, Digest) {
     let digest = digest(&data);
     (
@@ -103,7 +114,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
     let mut blobs = Vec::new();
 
     fn convert_file_rec(file: &NarFile, acc: &mut Vec<Blob>) -> Digest {
-        let (blob, digest) = blob(file.contents.as_ref().to_owned());
+        let (blob, digest) = blob_cloned(&file.contents);
         acc.push(blob);
         digest
     }
@@ -114,7 +125,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
         let mut directories = Vec::new();
         for entry in entries {
             // FIXME: proper error for non-utf8 names. The protocol apparently doesn't support non-utf8 names.
-            let name = String::from_utf8(entry.name.as_ref().to_owned()).unwrap();
+            let name = entry.name.to_string().unwrap();
             match &entry.node {
                 Nar::Contents(file) => {
                     let digest = convert_file_rec(file, acc);
@@ -128,7 +139,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
                     files.push(node);
                 }
                 Nar::Target(sym) => {
-                    let target = String::from_utf8(sym.as_ref().to_owned()).unwrap();
+                    let target = sym.to_string().unwrap();
                     let properties = default_properties(true);
                     let node = SymlinkNode {
                         name,
@@ -218,9 +229,10 @@ async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyh
 
 fn build_input_root(
     store_path_map: &HashMap<StorePath, PathInfo>,
-    paths: &StorePathSet,
+    derivation: &Derivation,
 ) -> (Vec<Blob>, Digest) {
-    let (files, dirs): (Vec<_>, Vec<_>) = paths
+    let (files, dirs): (Vec<_>, Vec<_>) = derivation
+        .input_sources
         .paths
         .iter()
         .partition(|t| matches!(store_path_map.get(t).unwrap().ty, PathType::File { .. }));
@@ -272,8 +284,28 @@ fn build_input_root(
     };
     let (nix_dir_blob, nix_dir_digest) = blob(nix_dir.encode_to_vec());
 
+    // Serialize the derivation to json and include it in the root directory.
+    let contents = bincode::serialize(derivation).unwrap();
+    let (deriv_blob, deriv_digest) = blob(contents);
+
+    let drv_builder = include_bytes!("../../../target/x86_64-unknown-linux-musl/debug/drv-adapter");
+    let (drv_builder_blob, drv_builder_digest) = blob(drv_builder.to_vec());
+
     let root_dir = Directory {
-        files: vec![],
+        files: vec![
+            FileNode {
+                name: "root.drv".to_owned(),
+                digest: Some(deriv_digest),
+                is_executable: false,
+                node_properties: Some(default_properties(false)),
+            },
+            FileNode {
+                name: "drv-adapter".to_owned(),
+                digest: Some(drv_builder_digest),
+                is_executable: true,
+                node_properties: Some(default_properties(true)),
+            },
+        ],
         directories: vec![DirectoryNode {
             name: "nix".to_owned(),
             digest: Some(nix_dir_digest),
@@ -284,7 +316,13 @@ fn build_input_root(
     let (root_dir_blob, root_dir_digest) = blob(root_dir.encode_to_vec());
 
     (
-        vec![store_dir_blob, nix_dir_blob, root_dir_blob],
+        vec![
+            store_dir_blob,
+            nix_dir_blob,
+            root_dir_blob,
+            deriv_blob,
+            drv_builder_blob,
+        ],
         root_dir_digest,
     )
 }
@@ -311,25 +349,6 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("got version {v}");
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
-
-    let cmd = Command {
-        arguments: vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            // FIXME: build barn runs multiple executions in the same container! The /nix directory
-            // will be preserved between runs. Maybe chroot is more reliable?
-            "mv nix /; ls -R / > out.txt".to_owned(),
-        ],
-        environment_variables: vec![],
-        output_files: vec![],
-        output_directories: vec![],
-        output_paths: vec!["out.txt".to_owned()],
-        platform: None,
-        working_directory: "".to_owned(),
-        output_node_properties: vec![],
-    };
-    let (cmd_blob, cmd_digest) = blob(cmd.encode_to_vec());
-    upload_blob(&mut bs_client, cmd_blob).await?;
 
     while let Some(op) = nix.next_op()? {
         eprintln!("read op {op:?}");
@@ -361,12 +380,36 @@ async fn main() -> anyhow::Result<()> {
             }
             WorkerOp::BuildDerivation(op, _resp) => {
                 dbg!(&op);
-                let (blobs, input_digest) =
-                    build_input_root(&store_path_map, &op.0.derivation.input_sources);
+                let (blobs, input_digest) = build_input_root(&store_path_map, &op.0.derivation);
                 for blob in blobs {
                     upload_blob(&mut bs_client, blob).await?;
                 }
                 dbg!(&input_digest);
+
+                let cmd = Command {
+                    arguments: vec![
+                        // FIXME: build barn runs multiple executions in the same container! The /nix directory
+                        // will be preserved between runs. Maybe chroot is more reliable?
+                        "./drv-adapter".to_owned(),
+                    ],
+                    environment_variables: vec![],
+                    output_files: vec![],
+                    output_directories: vec![],
+                    // FIXME: buildbarn wants a relative output path, not an absolute one. I guess the drv-adapter
+                    // should move it back to the local directory
+                    output_paths: dbg!(op
+                        .0
+                        .derivation
+                        .outputs
+                        .iter()
+                        .map(|out| out.1.store_path.0.to_string().unwrap())
+                        .collect()),
+                    platform: None,
+                    working_directory: "".to_owned(),
+                    output_node_properties: vec![],
+                };
+                let (cmd_blob, cmd_digest) = blob(cmd.encode_to_vec());
+                upload_blob(&mut bs_client, cmd_blob).await?;
 
                 let action = Action {
                     command_digest: Some(cmd_digest),

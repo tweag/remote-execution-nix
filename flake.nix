@@ -19,6 +19,7 @@
           pkgs.fenix.stable.defaultToolchain
           pkgs.fenix.stable.rust-src
           pkgs.fenix.stable.rust-analyzer
+          pkgs.fenix.targets.x86_64-unknown-linux-musl.stable.rust-std
         ];
       in
       with pkgs;
