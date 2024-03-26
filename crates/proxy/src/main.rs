@@ -13,21 +13,33 @@
 // - (bonus: pack small files into batch requests)
 // - when uploading, check if the file is already there
 
+// Known issues:
+// - the fuse runner fails in unpackPhase because cp can't preserve permissions. Maybe set things up in /build instead? For now, hardlinking works
+
+// There is a choice to be made: do we store the files/trees in CAS, or do we store nars. Current strategy is storing files, and packing/unpacking nars in the proxy.
+// When returning the build result, we need to
+// - return a nar
+// - know all the references.
+// Current plan: build the nar on the fly and stream it. Have the builder precompute references and store them somewhere in the CAS.
+
 mod generated;
 
 use std::collections::HashMap;
-use std::hash;
 use std::io::{Cursor, Write};
 
 use futures::StreamExt;
-use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use generated::build::bazel::remote::execution::v2::{FileNode, NodeProperties};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
 use nix_remote::framed_data::FramedData;
 use nix_remote::nar::{NarDirectoryEntry, NarFile};
-use nix_remote::worker_op::{BuildDerivation, Derivation, Stream, ValidPathInfo, WorkerOp};
+use nix_remote::worker_op::{
+    BuildResult, Derivation, DerivationOutput, DrvOutputs, QueryPathInfoResponse, ValidPathInfo,
+    WorkerOp,
+};
 use nix_remote::{nar::Nar, NixProxy, NixReadExt, NixWriteExt};
-use nix_remote::{stderr, StorePath, StorePathSet, ValidPathInfoWithPath};
+use nix_remote::{
+    stderr, NarHash, NixString, Realisation, StorePath, StorePathSet, ValidPathInfoWithPath,
+};
 use prost::Message;
 use ring::{
     digest::{Context, SHA256},
@@ -327,6 +339,19 @@ fn build_input_root(
     )
 }
 
+struct BuildMetadata {
+    references: StorePathSet,
+    nar_hash: NarHash,
+    nar_size: u64,
+}
+
+struct BuiltPath {
+    deriver: StorePath,
+    root_digest: Digest,
+    registration_time: u64,
+    build_metadata: Digest,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // TODO: figure out how authentication is going to work. It doesn't seem to be defined as
@@ -350,11 +375,66 @@ async fn main() -> anyhow::Result<()> {
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
 
+    let mut queried_already = false;
+    let mut known_paths: HashMap<StorePath, Digest> = HashMap::new();
+    let mut built_paths: HashMap<StorePath, BuiltPath> = HashMap::new();
+
     while let Some(op) = nix.next_op()? {
         eprintln!("read op {op:?}");
         match op {
-            WorkerOp::QueryValidPaths(_op, resp) => {
-                let reply = resp.ty(StorePathSet { paths: Vec::new() });
+            WorkerOp::QueryValidPaths(op, resp) => {
+                dbg!(op);
+                if !queried_already {
+                    queried_already = true;
+                    let reply = resp.ty(StorePathSet { paths: Vec::new() });
+                    nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
+                    nix.write.inner.write_nix(&reply)?;
+                    nix.write.inner.flush()?;
+                } else {
+                    panic!()
+                }
+            }
+            WorkerOp::QueryPathInfo(path, resp) => {
+                let Some(BuiltPath {
+                    deriver,
+                    registration_time,
+                    build_metadata: _,
+                    ..
+                }) = built_paths.get(&path)
+                else {
+                    panic!("We don't know about the path {:?}", path);
+                };
+
+                // TODO: fetch BuildMetadata using its Digest
+                let BuildMetadata {
+                    references,
+                    nar_hash,
+                    nar_size,
+                } = BuildMetadata {
+                    references: StorePathSet { paths: vec![] },
+                    nar_hash: NarHash {
+                        data: serde_bytes::ByteBuf::from([
+                            100, 99, 102, 48, 99, 99, 50, 53, 52, 55, 52, 97, 55, 99, 53, 97, 99,
+                            102, 53, 99, 97, 52, 55, 57, 55, 48, 53, 52, 97, 57, 55, 49, 98, 97,
+                            53, 100, 52, 99, 57, 101, 48, 98, 56, 48, 55, 56, 49, 102, 100, 53, 53,
+                            99, 51, 48, 101, 100, 57, 50, 56, 52, 101, 53, 50, 50,
+                        ]),
+                    },
+                    nar_size: 488,
+                };
+
+                let reply = QueryPathInfoResponse {
+                    path: Some(ValidPathInfo {
+                        deriver: deriver.clone(),
+                        hash: nar_hash,
+                        references,
+                        registration_time: *registration_time,
+                        nar_size,
+                        ultimate: true,
+                        sigs: nix_remote::StringSet { paths: vec![] },
+                        content_address: NixString::default(),
+                    }),
+                };
                 nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
                 nix.write.inner.write_nix(&reply)?;
                 nix.write.inner.flush()?;
@@ -395,15 +475,15 @@ async fn main() -> anyhow::Result<()> {
                     environment_variables: vec![],
                     output_files: vec![],
                     output_directories: vec![],
-                    // FIXME: buildbarn wants a relative output path, not an absolute one. I guess the drv-adapter
-                    // should move it back to the local directory
-                    output_paths: dbg!(op
+                    output_paths: op
                         .0
                         .derivation
                         .outputs
                         .iter()
-                        .map(|out| out.1.store_path.0.to_string().unwrap())
-                        .collect()),
+                        // We turn the absolute /nix/store/... path into a relative nix/store/... path because
+                        // bazel wants a relative path. They point to the same thing because /nix is a symlink to nix.
+                        .map(|out| out.1.store_path.0.to_string().unwrap()[1..].to_owned()) // yuck
+                        .collect(),
                     platform: None,
                     working_directory: "".to_owned(),
                     output_node_properties: vec![],
@@ -425,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                 upload_blob(&mut bs_client, action_blob).await?;
 
                 let req = ExecuteRequest {
-                    instance_name: "fuse".to_string(),
+                    instance_name: "hardlinking".to_string(),
                     skip_cache_lookup: true,
                     action_digest: Some(action_digest),
                     execution_policy: None,
@@ -451,11 +531,67 @@ async fn main() -> anyhow::Result<()> {
                         );
                         let resp = ExecuteResponse::decode(resp.value.as_ref())?;
                         let action_result = resp.result.unwrap();
-                        dbg!(action_result);
+                        dbg!(&action_result);
+
+                        if action_result.exit_code != 0 {
+                            panic!();
+                        }
+
+                        let (start_time, stop_time) = action_result
+                            .execution_metadata
+                            .and_then(|m| {
+                                m.worker_start_timestamp.zip(m.worker_completed_timestamp)
+                            })
+                            .unwrap_or_default();
+
+                        for output in op.0.derivation.outputs {
+                            let mut output_paths = action_result
+                                .output_directories
+                                .iter()
+                                .cloned()
+                                .map(|d| (d.path, d.tree_digest.unwrap()))
+                                .chain(
+                                    action_result
+                                        .output_files
+                                        .iter()
+                                        .cloned()
+                                        .map(|f| (f.path, f.digest.unwrap())),
+                                );
+                            built_paths.insert(
+                                StorePath(output.1.store_path.0.clone()),
+                                BuiltPath {
+                                    deriver: op.0.store_path.clone(),
+                                    root_digest: output_paths
+                                        .find(|(path, _)| {
+                                            dbg!(&path, &output.1.store_path);
+                                            path.as_bytes()
+                                                == &AsRef::<[u8]>::as_ref(&output.1.store_path)[1..]
+                                        })
+                                        .unwrap()
+                                        .1,
+                                    registration_time: stop_time.seconds as u64,
+                                    build_metadata: Digest::default(), // TODO get the right digest
+                                },
+                            );
+                        }
+
+                        let resp = BuildResult {
+                            status: nix_remote::worker_op::BuildStatus::Built,
+                            error_msg: NixString::default(),
+                            times_built: 1,
+                            is_non_deterministic: false,
+                            start_time: start_time.seconds as u64, // FIXME
+                            stop_time: stop_time.seconds as u64,
+                            built_outputs: DrvOutputs(vec![]),
+                        };
+                        nix.write.inner.write_nix(&stderr::Msg::Last(()))?; // TODO: send the worker's stderr
+                        nix.write.inner.write_nix(&resp)?;
+                        nix.write.inner.flush()?;
                     }
                 }
-
-                todo!()
+            }
+            WorkerOp::NarFromPath(op, resp) => {
+                todo!("pack up the nar to get a hash failure");
             }
             _ => {
                 panic!("ignoring op");

@@ -37,6 +37,19 @@
             alias find=fd
           '';
         };
+
+        packages.test = pkgs.stdenv.mkDerivation {
+          pname = "test";
+          version = "0.0.1";
+          src = ./.;
+
+
+          installPhase = ''
+            mkdir -p $out
+            echo ${builtins.toString builtins.currentTime} >> $out/out.txt
+            echo "hi" >> $out/hi.txt
+          '';
+        };
       }
     );
 }
