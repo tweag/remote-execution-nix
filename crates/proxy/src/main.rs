@@ -1,9 +1,3 @@
-// Next time:
-// - Write the statically linked binary that sets up the env:
-//   https://github.com/NixOS/nix/blob/c3e9e3d0c34105caef4af2589b6195da23684336/src/libstore/build/local-derivation-goal.cc#L1096
-// - Include that binary in the input root for the CAS
-// - Run it
-
 // TODO:
 // - to do the builds, we'll need to map nix store paths to digests so that we
 //   can fetch the filesystem trees; we have an innmemory version, but we may need to persist it into the AC

@@ -3,4 +3,6 @@ members = ["generator", "crates/proxy", "crates/drv-adapter"]
 resolver = "2"
 
 [workspace.dependencies]
-nix-remote = { git = "https://github.com/tweag/nix-remote-rust.git" }
+#nix-remote = { git = "https://github.com/tweag/nix-remote-rust.git" }
+nix-remote = { path = "../nix-remote-rust" }
+walkdir = "2.5"
