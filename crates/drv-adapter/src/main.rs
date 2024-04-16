@@ -1,9 +1,9 @@
 // TODO: Set up shared lib to use between drv-adapter and proxy workspaces
 // - Standardize the BuildMetadata and OutputMetada structs in the shared lib, and use in both workspaces
 // - Write BuildMetadata and send back to the client
-// - Scan for references in build outputs
+// - fInd possible refrences to pass to the reference scanner
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     io::{Cursor, Write},
     os::unix::ffi::OsStrExt,
@@ -12,16 +12,21 @@ use std::{
     process::{exit, Command},
 };
 
+use aho_corasick::AhoCorasick;
+
 use ring::digest::{Context, Digest, SHA256};
 
 use fs_extra::dir::CopyOptions;
 use nix_remote::{
     nar::{DirectorySink, EntrySink, FileSink, Nar},
+    serialize::Tee,
     worker_op::Derivation,
     NixString, NixWriteExt, StorePath,
 };
 use serde::Serialize;
 use walkdir::WalkDir;
+
+type NixHash = Vec<u8>;
 
 #[derive(Serialize)]
 struct OutputMetadata {
@@ -67,6 +72,78 @@ impl Write for HashSink {
     }
 }
 
+struct RefScanSink {
+    hashes: AhoCorasick,
+    hash_to_path: HashMap<NixHash, StorePath>,
+    seen: HashSet<StorePath>,
+    tail: Vec<u8>,
+}
+
+impl RefScanSink {
+    fn new(possible_paths: impl IntoIterator<Item = StorePath>) -> RefScanSink {
+        let hash_to_path: HashMap<_, _> = possible_paths
+            .into_iter()
+            .map(|path| (path.as_ref()[..32].to_owned(), path))
+            .collect();
+        RefScanSink {
+            hashes: AhoCorasick::new(hash_to_path.keys()).unwrap(),
+            hash_to_path,
+            seen: HashSet::new(),
+            tail: Vec::new(),
+        }
+    }
+
+    fn scan(&mut self) {
+        self.seen
+            .extend(self.hashes.find_overlapping_iter(&self.tail).map(|m| {
+                self.hash_to_path
+                    .get(&self.tail[m.range()])
+                    .unwrap()
+                    .clone()
+            }));
+    }
+}
+
+impl Write for RefScanSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tail.extend_from_slice(buf);
+        self.scan();
+
+        let tail_start = buf.len().saturating_sub(31);
+        self.tail.drain(..tail_start);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct Wye<W1, W2> {
+    w1: W1,
+    w2: W2,
+}
+
+impl<W1, W2> Wye<W1, W2> {
+    fn new(w1: W1, w2: W2) -> Self {
+        Wye { w1, w2 }
+    }
+}
+
+impl<W1: Write, W2: Write> Write for Wye<W1, W2> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.w1.write_all(buf)?;
+        self.w2.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w1.flush()?;
+        self.w2.flush()?;
+        Ok(())
+    }
+}
+
 // TODO: clean up error handling, and move to the other crate
 fn nar_from_filesystem<'a>(path: impl AsRef<Path>, sink: impl EntrySink<'a>) {
     let path = path.as_ref();
@@ -98,14 +175,26 @@ fn nar_from_filesystem<'a>(path: impl AsRef<Path>, sink: impl EntrySink<'a>) {
     }
 }
 
-fn path_to_digest(path: impl AsRef<Path>) -> (Digest, usize) {
-    let mut out = HashSink::new();
+fn path_to_metadata(
+    possible_references: impl IntoIterator<Item = StorePath>,
+    path: impl AsRef<Path>,
+) -> OutputMetadata {
+    let mut hasher = HashSink::new();
+    let mut ref_scanner = RefScanSink::new(possible_references);
+
+    let mut out = Wye::new(ref_scanner, hasher);
 
     let mut nar = Nar::Target(NixString::from_bytes(b""));
     nar_from_filesystem(path, &mut nar);
     out.write_nix(&nar).unwrap();
 
-    out.finish()
+    let (digest, nar_size) = hasher.finish();
+
+    OutputMetadata {
+        references: ref_scanner.seen.into_iter().collect(),
+        nar_hash: NixString::from_bytes(digest.as_ref()),
+        nar_size,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -173,15 +262,9 @@ fn main() -> anyhow::Result<()> {
             .arg("nix/store/")
             .status()?);
 
-        let (digest, size) = path_to_digest(path);
-        metadata.metadata.insert(
-            key,
-            OutputMetadata {
-                references: Vec::new(),
-                nar_hash: NixString::from_bytes(digest.as_ref()),
-                nar_size: size,
-            },
-        );
+        metadata
+            .metadata
+            .insert(key, path_to_metadata(todo!(), path));
     }
 
     if let Some(code) = status.code() {
