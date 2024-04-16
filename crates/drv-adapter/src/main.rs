@@ -1,13 +1,18 @@
+// TODO: Set up shared lib to use between drv-adapter and proxy workspaces
+// - Standardize the BuildMetadata and OutputMetada structs in the shared lib, and use in both workspaces
+// - Write BuildMetadata and send back to the client
+// - Scan for references in build outputs
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::File,
-    io::Cursor,
+    io::{Cursor, Write},
     os::unix::ffi::OsStrExt,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{exit, Command},
 };
+
+use ring::digest::{Context, Digest, SHA256};
 
 use fs_extra::dir::CopyOptions;
 use nix_remote::{
@@ -29,6 +34,37 @@ struct OutputMetadata {
 struct BuildMetadata {
     // The key is the output name, like "bin"
     metadata: HashMap<NixString, OutputMetadata>,
+}
+
+struct HashSink {
+    hash: Context,
+    size: usize,
+}
+
+impl HashSink {
+    fn new() -> Self {
+        HashSink {
+            hash: Context::new(&SHA256),
+            size: 0,
+        }
+    }
+
+    /// Return the digest of the hash.
+    fn finish(self) -> (Digest, usize) {
+        (self.hash.finish(), self.size)
+    }
+}
+
+impl Write for HashSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hash.update(buf);
+        self.size += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // TODO: clean up error handling, and move to the other crate
@@ -60,6 +96,16 @@ fn nar_from_filesystem<'a>(path: impl AsRef<Path>, sink: impl EntrySink<'a>) {
     } else {
         panic!("not a dir, or a file, or a symlink")
     }
+}
+
+fn path_to_digest(path: impl AsRef<Path>) -> (Digest, usize) {
+    let mut out = HashSink::new();
+
+    let mut nar = Nar::Target(NixString::from_bytes(b""));
+    nar_from_filesystem(path, &mut nar);
+    out.write_nix(&nar).unwrap();
+
+    out.finish()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -115,7 +161,10 @@ fn main() -> anyhow::Result<()> {
         .envs(dbg!(drv.env))
         .status()?;
 
-    for (_, out) in drv.outputs {
+    let mut metadata = BuildMetadata {
+        metadata: HashMap::new(),
+    };
+    for (key, out) in drv.outputs {
         // cp /nix/store/... nix/store
         let path: &OsStr = std::os::unix::ffi::OsStrExt::from_bytes(out.store_path.as_ref());
         dbg!(Command::new("cp")
@@ -123,6 +172,16 @@ fn main() -> anyhow::Result<()> {
             .arg(path)
             .arg("nix/store/")
             .status()?);
+
+        let (digest, size) = path_to_digest(path);
+        metadata.metadata.insert(
+            key,
+            OutputMetadata {
+                references: Vec::new(),
+                nar_hash: NixString::from_bytes(digest.as_ref()),
+                nar_size: size,
+            },
+        );
     }
 
     if let Some(code) = status.code() {
