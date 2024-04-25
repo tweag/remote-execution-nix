@@ -24,6 +24,7 @@ use std::io::{Cursor, Write};
 use futures::StreamExt;
 use generated::build::bazel::remote::execution::v2::{FileNode, NodeProperties};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
+use generated::google::bytestream::ReadRequest;
 use nix_remote::framed_data::FramedData;
 use nix_remote::nar::{NarDirectoryEntry, NarFile};
 use nix_remote::worker_op::{
@@ -39,7 +40,8 @@ use ring::{
     digest::{Context, SHA256},
     hkdf::HKDF_SHA256,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
@@ -59,6 +61,21 @@ use crate::generated::google::bytestream::WriteRequest;
 #[derive(serde::Deserialize, Debug)]
 struct AddMultipleToStoreData {
     data: Vec<(ValidPathInfoWithPath, Nar)>,
+}
+
+const METADATA_PATH: &str = "outputmetadata";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutputMetadata {
+    references: Vec<StorePath>,
+    nar_hash: NixString,
+    nar_size: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BuildMetadata {
+    // The key is the output name, like "bin"
+    metadata: HashMap<NixString, OutputMetadata>,
 }
 
 struct Blob {
@@ -233,6 +250,27 @@ async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyh
     Ok(())
 }
 
+async fn download_blob(
+    client: &mut ByteStreamClient<Channel>,
+    digest: &Digest,
+) -> anyhow::Result<Vec<u8>> {
+    let resource_name = format!("my-instance/blobs/{}/{}", digest.hash, digest.size_bytes);
+    let req = ReadRequest {
+        resource_name,
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    let mut resp = client.read(req).await?.into_inner();
+    let mut buf = Vec::new();
+    while let Some(next) = resp.next().await {
+        let next = next?;
+        buf.extend_from_slice(&next.data);
+    }
+
+    Ok(buf)
+}
+
 fn build_input_root(
     store_path_map: &HashMap<StorePath, PathInfo>,
     derivation: &Derivation,
@@ -333,12 +371,6 @@ fn build_input_root(
     )
 }
 
-struct BuildMetadata {
-    references: StorePathSet,
-    nar_hash: NarHash,
-    nar_size: u64,
-}
-
 struct BuiltPath {
     deriver: StorePath,
     root_digest: Digest,
@@ -392,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
                 let Some(BuiltPath {
                     deriver,
                     registration_time,
-                    build_metadata: _,
+                    build_metadata,
                     ..
                 }) = built_paths.get(&path)
                 else {
@@ -400,30 +432,28 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 // TODO: fetch BuildMetadata using its Digest
-                let BuildMetadata {
+                let metadata_blob = download_blob(&mut bs_client, build_metadata).await.unwrap();
+                let metadata: BuildMetadata = bincode::deserialize(&metadata_blob).unwrap();
+                dbg!(&metadata);
+                let OutputMetadata {
                     references,
                     nar_hash,
                     nar_size,
-                } = BuildMetadata {
-                    references: StorePathSet { paths: vec![] },
-                    nar_hash: NarHash {
-                        data: serde_bytes::ByteBuf::from([
-                            100, 99, 102, 48, 99, 99, 50, 53, 52, 55, 52, 97, 55, 99, 53, 97, 99,
-                            102, 53, 99, 97, 52, 55, 57, 55, 48, 53, 52, 97, 57, 55, 49, 98, 97,
-                            53, 100, 52, 99, 57, 101, 48, 98, 56, 48, 55, 56, 49, 102, 100, 53, 53,
-                            99, 51, 48, 101, 100, 57, 50, 56, 52, 101, 53, 50, 50,
-                        ]),
-                    },
-                    nar_size: 488,
-                };
+                } = metadata.metadata.get(&path.0 .0).unwrap();
 
                 let reply = QueryPathInfoResponse {
                     path: Some(ValidPathInfo {
                         deriver: deriver.clone(),
-                        hash: nar_hash,
-                        references,
+                        hash: NarHash {
+                            // TODO(next time): figure out the right hash encoding
+                            // TODO(next time): make a test build with references
+                            data: nar_hash.0.clone(),
+                        },
+                        references: StorePathSet {
+                            paths: references.clone(),
+                        },
                         registration_time: *registration_time,
-                        nar_size,
+                        nar_size: *nar_size as u64,
                         ultimate: true,
                         sigs: nix_remote::StringSet { paths: vec![] },
                         content_address: NixString::default(),
@@ -477,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
                         // We turn the absolute /nix/store/... path into a relative nix/store/... path because
                         // bazel wants a relative path. They point to the same thing because /nix is a symlink to nix.
                         .map(|out| out.1.store_path.0.to_string().unwrap()[1..].to_owned()) // yuck
+                        .chain(std::iter::once(METADATA_PATH.to_owned()))
                         .collect(),
                     platform: None,
                     working_directory: "".to_owned(),
@@ -538,6 +569,15 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .unwrap_or_default();
 
+                        let metadata_digest = action_result
+                            .output_files
+                            .iter()
+                            .find(|file| file.path == METADATA_PATH)
+                            .unwrap()
+                            .digest
+                            .as_ref()
+                            .unwrap();
+
                         for output in op.0.derivation.outputs {
                             let mut output_paths = action_result
                                 .output_directories
@@ -564,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
                                         .unwrap()
                                         .1,
                                     registration_time: stop_time.seconds as u64,
-                                    build_metadata: Digest::default(), // TODO get the right digest
+                                    build_metadata: metadata_digest.clone(),
                                 },
                             );
                         }

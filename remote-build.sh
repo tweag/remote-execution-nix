@@ -22,5 +22,6 @@ nix build -L -v -o result --max-jobs 0 \
  --store $TEST_ROOT/local \
  --builders "$builder" --impure
 
+ #.#test \
  #--expr '(builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}.writeText "current-time" "${builtins.toString builtins.currentTime}"' \
 

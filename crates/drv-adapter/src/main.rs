@@ -5,6 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
+    fs::File,
     io::{Cursor, Write},
     os::unix::ffi::OsStrExt,
     os::unix::fs::PermissionsExt,
@@ -23,21 +24,24 @@ use nix_remote::{
     worker_op::Derivation,
     NixString, NixWriteExt, StorePath,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 type NixHash = Vec<u8>;
 
-#[derive(Serialize)]
+// FIXME: put in shared crate
+const METADATA_PATH: &str = "outputmetadata";
+
+#[derive(Serialize, Deserialize)]
 struct OutputMetadata {
     references: Vec<StorePath>,
     nar_hash: NixString,
     nar_size: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BuildMetadata {
-    // The key is the output name, like "bin"
+    // The key is the store path.
     metadata: HashMap<NixString, OutputMetadata>,
 }
 
@@ -182,7 +186,7 @@ fn path_to_metadata(
     let mut hasher = HashSink::new();
     let mut ref_scanner = RefScanSink::new(possible_references);
 
-    let mut out = Wye::new(ref_scanner, hasher);
+    let mut out = Wye::new(&mut ref_scanner, &mut hasher);
 
     let mut nar = Nar::Target(NixString::from_bytes(b""));
     nar_from_filesystem(path, &mut nar);
@@ -250,10 +254,21 @@ fn main() -> anyhow::Result<()> {
         .envs(dbg!(drv.env))
         .status()?;
 
+    // Nix says:
+    /* The paths that can be referenced are the input closures, the
+    output paths, and any paths that have been built via recursive
+    Nix calls. */
+    // We don't know about recursive Nix calls, so we just do the other two.
+    // FIXME: We're not sure yet if the input_sources includes the closure...
+    let possible_references = drv.input_sources.paths.iter().cloned().chain(
+        drv.outputs
+            .iter()
+            .map(|(_name, out)| out.store_path.clone()),
+    );
     let mut metadata = BuildMetadata {
         metadata: HashMap::new(),
     };
-    for (key, out) in drv.outputs {
+    for (_key, out) in &drv.outputs {
         // cp /nix/store/... nix/store
         let path: &OsStr = std::os::unix::ffi::OsStrExt::from_bytes(out.store_path.as_ref());
         dbg!(Command::new("cp")
@@ -262,10 +277,13 @@ fn main() -> anyhow::Result<()> {
             .arg("nix/store/")
             .status()?);
 
-        metadata
-            .metadata
-            .insert(key, path_to_metadata(todo!(), path));
+        metadata.metadata.insert(
+            out.store_path.0.clone(),
+            path_to_metadata(possible_references.clone(), path),
+        );
     }
+    let out = File::create(METADATA_PATH).unwrap();
+    bincode::serialize_into(out, &metadata).unwrap();
 
     if let Some(code) = status.code() {
         exit(code);
