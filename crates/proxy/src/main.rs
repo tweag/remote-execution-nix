@@ -22,11 +22,12 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 
 use futures::StreamExt;
-use generated::build::bazel::remote::execution::v2::{FileNode, NodeProperties};
+use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
+use generated::build::bazel::remote::execution::v2::{FileNode, GetTreeRequest, NodeProperties};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
 use generated::google::bytestream::ReadRequest;
 use nix_remote::framed_data::FramedData;
-use nix_remote::nar::{NarDirectoryEntry, NarFile};
+use nix_remote::nar::{EntrySink, NarDirectoryEntry, NarFile};
 use nix_remote::worker_op::{
     BuildResult, Derivation, DerivationOutput, DrvOutputs, QueryPathInfoResponse, ValidPathInfo,
     WorkerOp,
@@ -371,6 +372,7 @@ fn build_input_root(
     )
 }
 
+#[derive(Debug)]
 struct BuiltPath {
     deriver: StorePath,
     root_digest: Digest,
@@ -444,11 +446,7 @@ async fn main() -> anyhow::Result<()> {
                 let reply = QueryPathInfoResponse {
                     path: Some(ValidPathInfo {
                         deriver: deriver.clone(),
-                        hash: NarHash {
-                            // TODO(next time): figure out the right hash encoding
-                            // TODO(next time): make a test build with references
-                            data: nar_hash.0.clone(),
-                        },
+                        hash: NarHash::from_bytes(nar_hash.as_ref()),
                         references: StorePathSet {
                             paths: references.clone(),
                         },
@@ -625,7 +623,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             WorkerOp::NarFromPath(op, resp) => {
-                todo!("pack up the nar to get a hash failure");
+                nix.write.inner.write_nix(&stderr::Msg::Last(()))?; // TODO: send the worker's stderr
+                nix.write.inner.write_nix(&Nar::default())?; // TODO: replace with real Nar
+                dbg!(&op, built_paths.get(&op));
+                nix.write.inner.flush()?;
             }
             _ => {
                 panic!("ignoring op");
@@ -686,3 +687,63 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// We want a non-paginated response for get_tree
+// TODO Finish this work, maybe change it to be based on this: https://github.com/bazelbuild/remote-apis-sdks/blob/8a36686a6350d32b9f40c213290b107a59e2ab00/go/pkg/client/cas_download.go#L471
+// async fn get_tree(
+//     digest: &Digest,
+//     ca_client: &mut ContentAddressableStorageClient<Channel>,
+// ) -> Vec<Directory> {
+//     let mut directories = Vec::new();
+
+//     let req = GetTreeRequest {
+//         instance_name: "my-instance".to_string(),
+//         root_digest: Some(digest.clone()),
+//         page_size: 0,
+//         page_token: "".to_string(),
+//     };
+
+//     let resp = ca_client.get_tree(req).await.unwrap().into_inner();
+
+//     resp.map(|r| r.directories).concat().await
+
+//     directories.append(resp.directories);
+
+//     directories
+// }
+
+// async fn nar_from_tree<'a>(
+//     digest: &Digest,
+//     bs_client: &mut ByteStreamClient<Channel>,
+//     ca_client: &mut ContentAddressableStorageClient<Channel>,
+//     sink: impl EntrySink<'a>,
+// ) {
+//     let dirs = get_tree(digest, ca_client);
+
+//     let metadata = std::fs::symlink_metadata(path).unwrap();
+//     if metadata.is_dir() {
+//         let mut dir_sink = sink.become_directory();
+//         let entries: Result<Vec<_>, _> = std::fs::read_dir(path).unwrap().collect();
+//         let mut entries = entries.unwrap();
+//         entries.sort_by_key(|e| e.file_name());
+
+//         for entry in entries {
+//             let file_name = entry.file_name();
+//             let name = file_name.as_bytes();
+//             let entry_sink = dir_sink.create_entry(NixString::from_bytes(name));
+//             nar_from_filesystem(entry.path(), entry_sink);
+//         }
+//     } else if metadata.is_file() {
+//         let mut file_sink = sink.become_file();
+//         let executable = (metadata.permissions().mode() & 0o100) != 0;
+//         // TODO: make this streaming
+//         let contents = std::fs::read(path).unwrap(); // FIXME
+//         file_sink.set_executable(executable);
+//         file_sink.add_contents(&contents);
+//     } else if metadata.is_symlink() {
+//         let target = std::fs::read_link(path).unwrap();
+//         sink.become_symlink(NixString::from_bytes(target.into_os_string().as_bytes()));
+//     } else {
+//         panic!("not a dir, or a file, or a symlink")
+//     }
+// }

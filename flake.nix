@@ -47,7 +47,7 @@
           installPhase = ''
             mkdir -p $out
             echo ${builtins.toString builtins.currentTime} >> $out/out.txt
-            echo "hi" >> $out/hi.txt
+            echo "${pkgs.bash}" >> $out/hi.txt
           '';
         };
       }
