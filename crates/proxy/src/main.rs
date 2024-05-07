@@ -20,14 +20,17 @@ mod generated;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
+use std::path::PathBuf;
 
 use futures::StreamExt;
 use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
-use generated::build::bazel::remote::execution::v2::{FileNode, GetTreeRequest, NodeProperties};
+use generated::build::bazel::remote::execution::v2::{
+    FileNode, GetTreeRequest, NodeProperties, OutputDirectory, Tree,
+};
 use generated::google::bytestream::byte_stream_client::ByteStreamClient;
 use generated::google::bytestream::ReadRequest;
 use nix_remote::framed_data::FramedData;
-use nix_remote::nar::{EntrySink, NarDirectoryEntry, NarFile};
+use nix_remote::nar::{DirectorySink, EntrySink, FileSink, NarDirectoryEntry, NarFile};
 use nix_remote::worker_op::{
     BuildResult, Derivation, DerivationOutput, DrvOutputs, QueryPathInfoResponse, ValidPathInfo,
     WorkerOp,
@@ -270,6 +273,14 @@ async fn download_blob(
     }
 
     Ok(buf)
+}
+
+async fn download_proto<T: prost::Message + Default>(
+    client: &mut ByteStreamClient<Channel>,
+    digest: &Digest,
+) -> anyhow::Result<T> {
+    let bytes = download_blob(client, digest).await?;
+    Ok(T::decode(bytes.as_ref())?)
 }
 
 fn build_input_root(
@@ -607,6 +618,9 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
 
+                        dbg!("HELLO");
+                        debug_tree(&mut bs_client, &action_result.output_directories[0]).await;
+
                         let resp = BuildResult {
                             status: nix_remote::worker_op::BuildStatus::Built,
                             error_msg: NixString::default(),
@@ -686,6 +700,78 @@ async fn main() -> anyhow::Result<()> {
     // dbg!(result);
 
     Ok(())
+}
+
+async fn debug_tree(bs_client: &mut ByteStreamClient<Channel>, output_directory: &OutputDirectory) {
+    let tree: Tree = download_proto(bs_client, output_directory.tree_digest.as_ref().unwrap())
+        .await
+        .unwrap();
+
+    dbg!(&tree);
+    dbg!(flatten_tree(&tree));
+}
+
+// String is the hash of a digest
+fn digest_directory_map(tree: &Tree) -> HashMap<String, Directory> {
+    tree.children
+        .iter()
+        .chain(tree.root.as_ref())
+        .map(|dir| {
+            let msg = dir.encode_to_vec();
+            let digest = digest(&msg);
+            (digest.hash, dir.clone())
+        })
+        .collect()
+}
+
+// HACK: the returned thing isn't the real nar, but the file "contents" are replaced by some serialized digest.
+// TODO(eventually): make nar generic over the file contents
+fn flatten_tree(tree: &Tree) -> Nar {
+    let dirs = digest_directory_map(tree);
+    let mut nar = Nar::default();
+    let root = (&mut nar).become_directory();
+
+    fn flatten_tree_rec<'a>(
+        dir: &Directory,
+        dirs: &HashMap<String, Directory>,
+        mut sink: impl DirectorySink<'a>,
+    ) {
+        for entry in &dir.files {
+            let mut file = sink.create_entry(entry.name.clone().into()).become_file();
+            let digest = entry.digest.as_ref().unwrap();
+            file.set_executable(entry.is_executable);
+            file.add_contents(format!("{}-{}", digest.hash, digest.size_bytes).as_bytes());
+        }
+
+        for entry in &dir.symlinks {
+            sink.create_entry(entry.name.clone().into())
+                .become_symlink(entry.target.clone().into());
+        }
+
+        for entry in &dir.directories {
+            let dir_sink = sink
+                .create_entry(entry.name.clone().into())
+                .become_directory();
+            let dir = dirs
+                .get(&entry.digest.as_ref().unwrap().hash)
+                .expect("some hash wasn't in our list");
+            flatten_tree_rec(dir, dirs, dir_sink);
+        }
+    }
+
+    flatten_tree_rec(tree.root.as_ref().unwrap(), &dirs, root);
+
+    nar.sort();
+    nar
+}
+
+// TODO(next time)
+async fn hydrate_nar<'a>(
+    bs_client: &mut ByteStreamClient<Channel>,
+    fake_nar: &Nar,
+    sink: impl EntrySink<'a>,
+) {
+    todo!()
 }
 
 // We want a non-paginated response for get_tree

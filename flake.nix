@@ -48,6 +48,8 @@
             mkdir -p $out
             echo ${builtins.toString builtins.currentTime} >> $out/out.txt
             echo "${pkgs.bash}" >> $out/hi.txt
+            mkdir -p $out/subdir/again
+            echo "hi" >> $out/subdir/again/file.txt
           '';
         };
       }
