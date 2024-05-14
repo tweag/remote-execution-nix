@@ -52,6 +52,17 @@
             echo "hi" >> $out/subdir/again/file.txt
           '';
         };
+
+        packages.test-file = pkgs.stdenv.mkDerivation {
+          pname = "test-file";
+          version = "0.0.1";
+          src = ./.;
+
+
+          installPhase = ''
+            echo ${builtins.toString builtins.currentTime} >> $out
+          '';
+        };
       }
     );
 }

@@ -18,7 +18,7 @@ rm -rf $TEST_ROOT/local/* || true
 
 nix build -L -v -o result --max-jobs 0 \
  --option builders-use-substitutes true \
- .#test \
+ .#test-file \
  --store $TEST_ROOT/local \
  --builders "$builder" --impure
 

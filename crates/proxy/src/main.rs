@@ -1,20 +1,26 @@
 // TODO:
-// - to do the builds, we'll need to map nix store paths to digests so that we
-//   can fetch the filesystem trees; we have an innmemory version, but we may need to persist it into the AC
-// - read the BuildDerivation op and figure out how to build it
-// - remove leading /nix/store from uploaded files in build_input_root
-// - basic sending of the nar tree works, but we aren't streaming
+// - store in BuildMetadata wether the path is a file or a directory, only try to the tree fetching if it's a directory, otherwise return a "singleton" NAR
+// - write a EntrySink impl for nix.write somehow, this will facilitate some streaming
+// - basic sending of the nar tree works, but we aren't streaming from or to nix
 // - (bonus: pack small files into batch requests)
-// - when uploading, check if the file is already there
+// - figure out how authentication is going to work. It doesn't seem to be defined as
+//   part of the REv2 protocol, so services like buildbuddy seem to roll their own.
+//   For now, we're using a locally-running buildbarn instance.
+// - send the worker's stderr, maybe even streaming while the build is running
+
+// TODO(eventually): make nar generic over the file contents to make the hydrating nicer
+
+// About using the action cache:
+// We should persist a mapping from nix store path to digest into the action cache. Then we can answer QueryValidPaths queries correctly and avoid redundant uploads from nix, and use the CAS as an actual nix store
 
 // Known issues:
 // - the fuse runner fails in unpackPhase because cp can't preserve permissions. Maybe set things up in /build instead? For now, hardlinking works
 
-// There is a choice to be made: do we store the files/trees in CAS, or do we store nars. Current strategy is storing files, and packing/unpacking nars in the proxy.
+// There was a choice to be made: do we store the files/trees in CAS, or do we store nars. Current strategy is storing files, and packing/unpacking nars in the proxy.
 // When returning the build result, we need to
 // - return a nar
 // - know all the references.
-// Current plan: build the nar on the fly and stream it. Have the builder precompute references and store them somewhere in the CAS.
+// Our approach: build the nar on the fly and stream it. Have the builder precompute references and store them somewhere in the CAS.
 
 mod generated;
 
@@ -399,9 +405,6 @@ struct BuiltPath {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // TODO: figure out how authentication is going to work. It doesn't seem to be defined as
-    // part of the REv2 protocol, so services like buildbuddy seem to roll their own.
-    // For now, we're using a locally-running buildgrid instance.
     let channel = Endpoint::from_static("http://localhost:8980")
         .connect()
         .await
@@ -409,7 +412,6 @@ async fn main() -> anyhow::Result<()> {
     //let mut cas_client = ContentAddressableStorageClient::new(channel.clone());
     let mut exec_client = ExecutionClient::new(channel.clone());
     let mut bs_client = ByteStreamClient::new(channel);
-    // TODO: put each of these mappings in the action cache
     let mut store_path_map = HashMap::new();
     eprintln!("Connected to CAS");
 
@@ -450,7 +452,6 @@ async fn main() -> anyhow::Result<()> {
                     panic!("We don't know about the path {:?}", path);
                 };
 
-                // TODO: fetch BuildMetadata using its Digest
                 let metadata_blob = download_blob(&mut bs_client, build_metadata).await.unwrap();
                 let metadata: BuildMetadata = bincode::deserialize(&metadata_blob).unwrap();
                 dbg!(&metadata);
@@ -624,9 +625,6 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
 
-                        dbg!("HELLO");
-                        debug_tree(&mut bs_client, &action_result.output_directories[0]).await;
-
                         let resp = BuildResult {
                             status: nix_remote::worker_op::BuildStatus::Built,
                             error_msg: NixString::default(),
@@ -636,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
                             stop_time: stop_time.seconds as u64,
                             built_outputs: DrvOutputs(vec![]),
                         };
-                        nix.write.inner.write_nix(&stderr::Msg::Last(()))?; // TODO: send the worker's stderr
+                        nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
                         nix.write.inner.write_nix(&resp)?;
                         nix.write.inner.flush()?;
                     }
@@ -650,8 +648,8 @@ async fn main() -> anyhow::Result<()> {
                 dbg!(&tree);
                 let flattened = flatten_tree(&tree);
 
-                nix.write.inner.write_nix(&stderr::Msg::Last(()))?; // TODO: send the worker's stderr
-                let mut nar = Nar::default(); // TODO(next time): write a EntrySink impl for nix.write somehow
+                nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
+                let mut nar = Nar::default();
                 hydrate_nar(&mut bs_client, flattened, &mut nar)
                     .await
                     .unwrap();
@@ -719,18 +717,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn debug_tree(bs_client: &mut ByteStreamClient<Channel>, output_directory: &OutputDirectory) {
-    let tree: Tree = download_proto(bs_client, output_directory.tree_digest.as_ref().unwrap())
-        .await
-        .unwrap();
-
-    dbg!(&tree);
-    let flattened = flatten_tree(&tree);
-    let mut nar = Nar::default();
-    let hydrated = hydrate_nar(bs_client, flattened, &mut nar).await;
-    dbg!(&nar);
-}
-
 // String is the hash of a digest
 fn digest_directory_map(tree: &Tree) -> HashMap<String, Directory> {
     tree.children
@@ -745,7 +731,6 @@ fn digest_directory_map(tree: &Tree) -> HashMap<String, Directory> {
 }
 
 // HACK: the returned thing isn't the real nar, but the file "contents" are replaced by some serialized digest.
-// TODO(eventually): make nar generic over the file contents
 fn flatten_tree(tree: &Tree) -> Nar {
     let dirs = digest_directory_map(tree);
     let mut nar = Nar::default();
@@ -825,63 +810,3 @@ fn hydrate_nar<'a, 'b: 'a>(
         Ok(())
     })
 }
-
-// We want a non-paginated response for get_tree
-// TODO Finish this work, maybe change it to be based on this: https://github.com/bazelbuild/remote-apis-sdks/blob/8a36686a6350d32b9f40c213290b107a59e2ab00/go/pkg/client/cas_download.go#L471
-// async fn get_tree(
-//     digest: &Digest,
-//     ca_client: &mut ContentAddressableStorageClient<Channel>,
-// ) -> Vec<Directory> {
-//     let mut directories = Vec::new();
-
-//     let req = GetTreeRequest {
-//         instance_name: "my-instance".to_string(),
-//         root_digest: Some(digest.clone()),
-//         page_size: 0,
-//         page_token: "".to_string(),
-//     };
-
-//     let resp = ca_client.get_tree(req).await.unwrap().into_inner();
-
-//     resp.map(|r| r.directories).concat().await
-
-//     directories.append(resp.directories);
-
-//     directories
-// }
-
-// async fn nar_from_tree<'a>(
-//     digest: &Digest,
-//     bs_client: &mut ByteStreamClient<Channel>,
-//     ca_client: &mut ContentAddressableStorageClient<Channel>,
-//     sink: impl EntrySink<'a>,
-// ) {
-//     let dirs = get_tree(digest, ca_client);
-
-//     let metadata = std::fs::symlink_metadata(path).unwrap();
-//     if metadata.is_dir() {
-//         let mut dir_sink = sink.become_directory();
-//         let entries: Result<Vec<_>, _> = std::fs::read_dir(path).unwrap().collect();
-//         let mut entries = entries.unwrap();
-//         entries.sort_by_key(|e| e.file_name());
-
-//         for entry in entries {
-//             let file_name = entry.file_name();
-//             let name = file_name.as_bytes();
-//             let entry_sink = dir_sink.create_entry(NixString::from_bytes(name));
-//             nar_from_filesystem(entry.path(), entry_sink);
-//         }
-//     } else if metadata.is_file() {
-//         let mut file_sink = sink.become_file();
-//         let executable = (metadata.permissions().mode() & 0o100) != 0;
-//         // TODO: make this streaming
-//         let contents = std::fs::read(path).unwrap(); // FIXME
-//         file_sink.set_executable(executable);
-//         file_sink.add_contents(&contents);
-//     } else if metadata.is_symlink() {
-//         let target = std::fs::read_link(path).unwrap();
-//         sink.become_symlink(NixString::from_bytes(target.into_os_string().as_bytes()));
-//     } else {
-//         panic!("not a dir, or a file, or a symlink")
-//     }
-// }
