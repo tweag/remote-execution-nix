@@ -21,8 +21,10 @@ mod generated;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 
-use futures::StreamExt;
+use anyhow::anyhow;
+use futures::{Future, StreamExt};
 use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use generated::build::bazel::remote::execution::v2::{
     FileNode, GetTreeRequest, NodeProperties, OutputDirectory, Tree,
@@ -31,6 +33,7 @@ use generated::google::bytestream::byte_stream_client::ByteStreamClient;
 use generated::google::bytestream::ReadRequest;
 use nix_remote::framed_data::FramedData;
 use nix_remote::nar::{DirectorySink, EntrySink, FileSink, NarDirectoryEntry, NarFile};
+use nix_remote::serialize::Tee;
 use nix_remote::worker_op::{
     BuildResult, Derivation, DerivationOutput, DrvOutputs, QueryPathInfoResponse, ValidPathInfo,
     WorkerOp,
@@ -254,17 +257,20 @@ async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyh
     Ok(())
 }
 
+fn blob_request(digest: &Digest) -> ReadRequest {
+    let resource_name = format!("my-instance/blobs/{}/{}", digest.hash, digest.size_bytes);
+    ReadRequest {
+        resource_name,
+        read_offset: 0,
+        read_limit: 0,
+    }
+}
+
 async fn download_blob(
     client: &mut ByteStreamClient<Channel>,
     digest: &Digest,
 ) -> anyhow::Result<Vec<u8>> {
-    let resource_name = format!("my-instance/blobs/{}/{}", digest.hash, digest.size_bytes);
-    let req = ReadRequest {
-        resource_name,
-        read_offset: 0,
-        read_limit: 0,
-    };
-
+    let req = blob_request(digest);
     let mut resp = client.read(req).await?.into_inner();
     let mut buf = Vec::new();
     while let Some(next) = resp.next().await {
@@ -636,10 +642,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            WorkerOp::NarFromPath(op, resp) => {
+            WorkerOp::NarFromPath(op, _resp) => {
+                let BuiltPath { root_digest, .. } = built_paths.get(&op).unwrap();
+
+                let tree: Tree = download_proto(&mut bs_client, root_digest).await.unwrap();
+
+                dbg!(&tree);
+                let flattened = flatten_tree(&tree);
+
                 nix.write.inner.write_nix(&stderr::Msg::Last(()))?; // TODO: send the worker's stderr
-                nix.write.inner.write_nix(&Nar::default())?; // TODO: replace with real Nar
-                dbg!(&op, built_paths.get(&op));
+                let mut nar = Nar::default(); // TODO(next time): write a EntrySink impl for nix.write somehow
+                hydrate_nar(&mut bs_client, flattened, &mut nar)
+                    .await
+                    .unwrap();
+                nix.write.inner.write_nix(&nar)?;
+
                 nix.write.inner.flush()?;
             }
             _ => {
@@ -708,7 +725,10 @@ async fn debug_tree(bs_client: &mut ByteStreamClient<Channel>, output_directory:
         .unwrap();
 
     dbg!(&tree);
-    dbg!(flatten_tree(&tree));
+    let flattened = flatten_tree(&tree);
+    let mut nar = Nar::default();
+    let hydrated = hydrate_nar(bs_client, flattened, &mut nar).await;
+    dbg!(&nar);
 }
 
 // String is the hash of a digest
@@ -765,13 +785,45 @@ fn flatten_tree(tree: &Tree) -> Nar {
     nar
 }
 
-// TODO(next time)
-async fn hydrate_nar<'a>(
-    bs_client: &mut ByteStreamClient<Channel>,
-    fake_nar: &Nar,
+fn hydrate_nar<'a, 'b: 'a>(
+    bs_client: &'b mut ByteStreamClient<Channel>,
+    fake_nar: Nar,
     sink: impl EntrySink<'a>,
-) {
-    todo!()
+) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+    Box::pin(async {
+        match fake_nar {
+            Nar::Contents(NarFile {
+                contents,
+                executable,
+            }) => {
+                let mut sink = sink.become_file();
+                sink.set_executable(executable);
+
+                let contents = contents.to_string()?;
+                let (hash, size_str) = contents
+                    .rsplit_once('-')
+                    .ok_or(anyhow!("invalid digest format"))?;
+                let digest = Digest {
+                    hash: hash.to_string(),
+                    size_bytes: size_str.parse()?,
+                };
+                let req = blob_request(&digest);
+                let mut resp = bs_client.read(req).await?.into_inner();
+                while let Some(next) = resp.next().await {
+                    let next = next?;
+                    sink.add_contents(&next.data);
+                }
+            }
+            Nar::Target(target) => sink.become_symlink(target),
+            Nar::Directory(entries) => {
+                let mut sink = sink.become_directory();
+                for NarDirectoryEntry { name, node } in entries {
+                    hydrate_nar(bs_client, node, sink.create_entry(name)).await?;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 // We want a non-paginated response for get_tree
