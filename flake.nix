@@ -60,7 +60,11 @@
 
 
           installPhase = ''
+            echo "Hello" >&2
             echo ${builtins.toString builtins.currentTime} >> $out
+            echo "World" >&2
+            chmod +x $out
+            echo "on stdout"
           '';
         };
       }

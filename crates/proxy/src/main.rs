@@ -1,17 +1,15 @@
 // TODO:
-// - store in BuildMetadata wether the path is a file or a directory, only try to the tree fetching if it's a directory, otherwise return a "singleton" NAR
+// - send the worker's stderr, maybe even streaming while the build is running
 // - write a EntrySink impl for nix.write somehow, this will facilitate some streaming
 // - basic sending of the nar tree works, but we aren't streaming from or to nix
 // - (bonus: pack small files into batch requests)
 // - figure out how authentication is going to work. It doesn't seem to be defined as
 //   part of the REv2 protocol, so services like buildbuddy seem to roll their own.
 //   For now, we're using a locally-running buildbarn instance.
-// - send the worker's stderr, maybe even streaming while the build is running
+// - About using the action cache:
+//   We should persist a mapping from nix store path to digest into the action cache. Then we can answer QueryValidPaths queries correctly and avoid redundant uploads from nix, and use the CAS as an actual nix store
 
 // TODO(eventually): make nar generic over the file contents to make the hydrating nicer
-
-// About using the action cache:
-// We should persist a mapping from nix store path to digest into the action cache. Then we can answer QueryValidPaths queries correctly and avoid redundant uploads from nix, and use the CAS as an actual nix store
 
 // Known issues:
 // - the fuse runner fails in unpackPhase because cp can't preserve permissions. Maybe set things up in /build instead? For now, hardlinking works
@@ -398,9 +396,9 @@ fn build_input_root(
 #[derive(Debug)]
 struct BuiltPath {
     deriver: StorePath,
-    root_digest: Digest,
     registration_time: u64,
     build_metadata: Digest,
+    info: PathInfo,
 }
 
 #[tokio::main]
@@ -595,30 +593,34 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap();
 
                         for output in op.0.derivation.outputs {
-                            let mut output_paths = action_result
+                            let output_store_path: &[u8] = &output.1.store_path.as_ref()[1..];
+                            let info = if let Some(dir) = action_result
                                 .output_directories
                                 .iter()
-                                .cloned()
-                                .map(|d| (d.path, d.tree_digest.unwrap()))
-                                .chain(
-                                    action_result
-                                        .output_files
-                                        .iter()
-                                        .cloned()
-                                        .map(|f| (f.path, f.digest.unwrap())),
-                                );
+                                .find(|d| d.path.as_bytes() == output_store_path)
+                            {
+                                PathInfo {
+                                    digest: dir.tree_digest.clone().unwrap(),
+                                    ty: PathType::Directory,
+                                }
+                            } else {
+                                let file = action_result
+                                    .output_files
+                                    .iter()
+                                    .find(|f| f.path.as_bytes() == output_store_path)
+                                    .unwrap();
+                                PathInfo {
+                                    digest: file.digest.clone().unwrap(),
+                                    ty: PathType::File {
+                                        executable: file.is_executable,
+                                    },
+                                }
+                            };
                             built_paths.insert(
                                 StorePath(output.1.store_path.0.clone()),
                                 BuiltPath {
                                     deriver: op.0.store_path.clone(),
-                                    root_digest: output_paths
-                                        .find(|(path, _)| {
-                                            dbg!(&path, &output.1.store_path);
-                                            path.as_bytes()
-                                                == &AsRef::<[u8]>::as_ref(&output.1.store_path)[1..]
-                                        })
-                                        .unwrap()
-                                        .1,
+                                    info,
                                     registration_time: stop_time.seconds as u64,
                                     build_metadata: metadata_digest.clone(),
                                 },
@@ -641,18 +643,33 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             WorkerOp::NarFromPath(op, _resp) => {
-                let BuiltPath { root_digest, .. } = built_paths.get(&op).unwrap();
+                let BuiltPath { info, .. } = built_paths.get(&op).unwrap();
 
-                let tree: Tree = download_proto(&mut bs_client, root_digest).await.unwrap();
+                let nar = match info.ty {
+                    PathType::File { executable } => {
+                        let file_contents = download_blob(&mut bs_client, &info.digest).await?;
+                        Nar::Contents(NarFile {
+                            contents: file_contents.into(),
+                            executable,
+                        })
+                    }
+                    PathType::Directory => {
+                        let tree: Tree =
+                            download_proto(&mut bs_client, &info.digest).await.unwrap();
 
-                dbg!(&tree);
-                let flattened = flatten_tree(&tree);
+                        dbg!(&tree);
+                        let flattened = flatten_tree(&tree);
 
+                        let mut nar = Nar::default();
+                        hydrate_nar(&mut bs_client, flattened, &mut nar)
+                            .await
+                            .unwrap();
+
+                        nar
+                    }
+                };
                 nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
-                let mut nar = Nar::default();
-                hydrate_nar(&mut bs_client, flattened, &mut nar)
-                    .await
-                    .unwrap();
+
                 nix.write.inner.write_nix(&nar)?;
 
                 nix.write.inner.flush()?;
