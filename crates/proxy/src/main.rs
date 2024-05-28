@@ -1,13 +1,18 @@
+// In the middle of doing:
+// we build action cache entries for each store path, and upload them on AddMultipleToStore
 // TODO:
-// - send the worker's stderr, maybe even streaming while the build is running
+// - also check for them in QueryValidPaths
+// - in BuildDerivation, lookup the cached digests. Stop using the in-memory thing
+// - register built paths also. Don't forget to wrap in nix/store/...
+
+// TODO:
 // - write a EntrySink impl for nix.write somehow, this will facilitate some streaming
 // - basic sending of the nar tree works, but we aren't streaming from or to nix
 // - (bonus: pack small files into batch requests)
 // - figure out how authentication is going to work. It doesn't seem to be defined as
 //   part of the REv2 protocol, so services like buildbuddy seem to roll their own.
 //   For now, we're using a locally-running buildbarn instance.
-// - About using the action cache:
-//   We should persist a mapping from nix store path to digest into the action cache. Then we can answer QueryValidPaths queries correctly and avoid redundant uploads from nix, and use the CAS as an actual nix store
+// - stream the worker's stderr and its stdout
 
 // TODO(eventually): make nar generic over the file contents to make the hydrating nicer
 
@@ -22,13 +27,14 @@
 
 mod generated;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::anyhow;
 use futures::{Future, StreamExt};
+use generated::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
 use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use generated::build::bazel::remote::execution::v2::{
     FileNode, GetTreeRequest, NodeProperties, OutputDirectory, Tree,
@@ -62,8 +68,9 @@ use crate::generated::build::bazel::remote::execution::v2::{
     FindMissingBlobsRequest,
 };
 use crate::generated::build::bazel::remote::execution::v2::{
-    Action, Command, Directory, DirectoryNode, ExecuteOperationMetadata, ExecuteRequest,
-    ExecuteResponse, SymlinkNode,
+    Action, ActionResult, Command, Directory, DirectoryNode, ExecuteOperationMetadata,
+    ExecuteRequest, ExecuteResponse, ExecutedActionMetadata, GetActionResultRequest, SymlinkNode,
+    UpdateActionResultRequest,
 };
 use crate::generated::google::bytestream::WriteRequest;
 
@@ -75,6 +82,7 @@ struct AddMultipleToStoreData {
 }
 
 const METADATA_PATH: &str = "outputmetadata";
+const INSTANCE: &str = "my-instance";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OutputMetadata {
@@ -94,13 +102,13 @@ struct Blob {
     digest: Digest,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum PathType {
     File { executable: bool },
     Directory,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PathInfo {
     digest: Digest,
     ty: PathType,
@@ -220,6 +228,7 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
+// TODO: check if the blob is there already
 async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyhow::Result<()> {
     // TODO: respect size limits by making actual streams
     let uuid = Uuid::new_v4();
@@ -259,6 +268,16 @@ async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyh
     dbg!(resource_name);
     client.write(futures::stream::iter(requests)).await?;
     Ok(())
+}
+
+async fn upload_proto<T: Message>(
+    client: &mut ByteStreamClient<Channel>,
+    data: &T,
+) -> anyhow::Result<Digest> {
+    let data = data.encode_to_vec();
+    let (blob, digest) = blob(data);
+    upload_blob(client, blob).await?;
+    Ok(digest)
 }
 
 fn blob_request(digest: &Digest) -> ReadRequest {
@@ -393,6 +412,150 @@ fn build_input_root(
     )
 }
 
+async fn lookup_store_paths(
+    cas_client: &mut ContentAddressableStorageClient<Channel>,
+    ac_client: &mut ActionCacheClient<Channel>,
+    paths: &[NixString],
+) -> anyhow::Result<HashMap<NixString, Digest>> {
+    let mut digest_map: HashMap<_, _> = paths
+        .iter()
+        .map(|path| (path, store_path_action_digest(path.to_string().unwrap())))
+        .collect();
+
+    let req = FindMissingBlobsRequest {
+        instance_name: INSTANCE.to_owned(),
+        blob_digests: digest_map.values().cloned().collect(),
+    };
+    let missing: HashSet<_> = cas_client
+        .find_missing_blobs(req)
+        .await?
+        .into_inner()
+        .missing_blob_digests
+        .into_iter()
+        .map(|d| d.hash)
+        .collect();
+
+    digest_map.retain(|_path, digest| !missing.contains(&digest.hash));
+
+    // TODO: be fancy
+    let mut ret = HashMap::new();
+    for (path, digest) in digest_map {
+        let req = GetActionResultRequest {
+            instance_name: INSTANCE.to_owned(),
+            action_digest: Some(digest),
+            inline_stdout: false,
+            inline_stderr: false,
+            inline_output_files: vec![],
+        };
+        let action_result = ac_client.get_action_result(req).await?.into_inner();
+        if action_result.output_directories.len() != 1 {
+            panic!("what?");
+        }
+        ret.insert(
+            path.clone(),
+            action_result.output_directories[0]
+                .tree_digest
+                .clone()
+                .unwrap(),
+        );
+    }
+    Ok(ret)
+}
+
+fn store_path_action_digest(store_path: String) -> Digest {
+    let cmd = Command {
+        arguments: vec![store_path],
+        environment_variables: vec![],
+        output_files: vec![],
+        output_directories: vec![],
+        output_paths: vec![],
+        platform: None,
+        working_directory: String::new(),
+        output_node_properties: vec![],
+    };
+    let cmd_digest = digest(&cmd.encode_to_vec());
+
+    let action = Action {
+        command_digest: Some(cmd_digest),
+        input_root_digest: None,
+        timeout: None,
+        do_not_cache: false,
+        salt: vec![],
+        platform: None, // question: should we set something here to ensure that no one accidentally executes this action?
+    };
+    digest(&action.encode_to_vec())
+}
+
+// Use this when the store path has already been uploaded to the CAS. root_digest is the digest of the store path's root directory
+// (well, not actually the store path's root directory: it points at a directory called "nix", which contains "store" etc)
+async fn add_store_path(
+    ac_client: &mut ActionCacheClient<Channel>,
+    bs_client: &mut ByteStreamClient<Channel>,
+    store_path: String,
+    root_digest: Digest,
+) -> anyhow::Result<()> {
+    let cmd = Command {
+        arguments: vec![store_path],
+        environment_variables: vec![],
+        output_files: vec![],
+        output_directories: vec![],
+        output_paths: vec![],
+        platform: None,
+        working_directory: String::new(),
+        output_node_properties: vec![],
+    };
+    let cmd_digest = upload_proto(bs_client, &cmd).await?;
+
+    let action = Action {
+        command_digest: Some(cmd_digest),
+        input_root_digest: None,
+        timeout: None,
+        do_not_cache: false,
+        salt: vec![],
+        platform: None, // question: should we set something here to ensure that no one accidentally executes this action?
+    };
+    let action_digest = upload_proto(bs_client, &action).await?;
+
+    let action_result = ActionResult {
+        output_files: vec![],
+        output_file_symlinks: vec![],
+        output_symlinks: vec![],
+        output_directories: vec![OutputDirectory {
+            path: String::new(),
+            tree_digest: Some(root_digest),
+        }],
+        output_directory_symlinks: vec![],
+        exit_code: 0,
+        stdout_raw: vec![],
+        stdout_digest: None,
+        stderr_raw: vec![],
+        stderr_digest: None,
+        execution_metadata: Some(ExecutedActionMetadata {
+            worker: "Nix store upload".to_owned(),
+            queued_timestamp: None,
+            worker_start_timestamp: None,
+            worker_completed_timestamp: None,
+            input_fetch_start_timestamp: None,
+            input_fetch_completed_timestamp: None,
+            execution_start_timestamp: None,
+            execution_completed_timestamp: None,
+            output_upload_start_timestamp: None,
+            output_upload_completed_timestamp: None,
+        }),
+    };
+
+    let req = UpdateActionResultRequest {
+        instance_name: "my-instance".to_owned(),
+        action_digest: Some(action_digest),
+        action_result: Some(action_result),
+        results_cache_policy: None,
+    };
+
+    ac_client.update_action_result(req).await?;
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct BuiltPath {
     deriver: StorePath,
@@ -409,6 +572,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap();
     //let mut cas_client = ContentAddressableStorageClient::new(channel.clone());
     let mut exec_client = ExecutionClient::new(channel.clone());
+    let mut ac_client = ActionCacheClient::new(channel.clone());
     let mut bs_client = ByteStreamClient::new(channel);
     let mut store_path_map = HashMap::new();
     eprintln!("Connected to CAS");
@@ -429,6 +593,8 @@ async fn main() -> anyhow::Result<()> {
         match op {
             WorkerOp::QueryValidPaths(op, resp) => {
                 dbg!(op);
+                // TODO:
+                // lookup_store_paths(&mut cas_client, &mut ac_client, op)
                 if !queried_already {
                     queried_already = true;
                     let reply = resp.ty(StorePathSet { paths: Vec::new() });
@@ -487,10 +653,17 @@ async fn main() -> anyhow::Result<()> {
                 let data: AddMultipleToStoreData = Cursor::new(buf).read_nix()?;
                 for (path, nar) in data.data {
                     let (blobs, root_info) = convert(&nar);
-                    store_path_map.insert(path.path, root_info);
+                    store_path_map.insert(path.path.clone(), root_info.clone());
                     for blob in blobs {
                         upload_blob(&mut bs_client, blob).await?;
                     }
+                    add_store_path(
+                        &mut ac_client,
+                        &mut bs_client,
+                        path.path.0.to_string().unwrap(),
+                        root_info.digest.clone(),
+                    )
+                    .await?;
                 }
                 nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
                 nix.write.inner.write_nix(&())?;
@@ -636,6 +809,14 @@ async fn main() -> anyhow::Result<()> {
                             stop_time: stop_time.seconds as u64,
                             built_outputs: DrvOutputs(vec![]),
                         };
+
+                        if let Some(stderr_digest) = action_result.stderr_digest {
+                            // TODO: stream this instead of sending all at once
+                            let stderr = download_blob(&mut bs_client, &stderr_digest).await?;
+                            nix.write
+                                .inner
+                                .write_nix(&stderr::Msg::Next(stderr.into()))?;
+                        }
                         nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
                         nix.write.inner.write_nix(&resp)?;
                         nix.write.inner.flush()?;

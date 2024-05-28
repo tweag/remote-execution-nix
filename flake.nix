@@ -58,8 +58,8 @@
           version = "0.0.1";
           src = ./.;
 
-
           installPhase = ''
+            cat ${self.packages.x86_64-linux.test}/hi.txt
             echo "Hello" >&2
             echo ${builtins.toString builtins.currentTime} >> $out
             echo "World" >&2
