@@ -1,6 +1,8 @@
 // In the middle of doing:
 // we build action cache entries for each store path, and upload them on AddMultipleToStore
 // TODO:
+// - There are two places where we are faking the root directory digest of a PathInfo by passing in the tree digest.
+//   We should be making an additional call to the CAS and fetching the correct directory digest
 // - also check for them in QueryValidPaths
 // - in BuildDerivation, lookup the cached digests. Stop using the in-memory thing
 // - register built paths also. Don't forget to wrap in nix/store/...
@@ -25,134 +27,82 @@
 // - know all the references.
 // Our approach: build the nar on the fly and stream it. Have the builder precompute references and store them somewhere in the CAS.
 
-mod generated;
-
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::anyhow;
 use futures::{Future, StreamExt};
-use generated::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
-use generated::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
-use generated::build::bazel::remote::execution::v2::{
-    FileNode, GetTreeRequest, NodeProperties, OutputDirectory, Tree,
-};
-use generated::google::bytestream::byte_stream_client::ByteStreamClient;
-use generated::google::bytestream::ReadRequest;
 use nix_remote::framed_data::FramedData;
 use nix_remote::nar::{DirectorySink, EntrySink, FileSink, NarDirectoryEntry, NarFile};
-use nix_remote::serialize::Tee;
 use nix_remote::worker_op::{
-    BuildResult, Derivation, DerivationOutput, DrvOutputs, QueryPathInfoResponse, ValidPathInfo,
-    WorkerOp,
+    BuildResult, Derivation, DrvOutputs, QueryPathInfoResponse, ValidPathInfo, WorkerOp,
 };
 use nix_remote::{nar::Nar, NixProxy, NixReadExt, NixWriteExt};
-use nix_remote::{
-    stderr, NarHash, NixString, Realisation, StorePath, StorePathSet, ValidPathInfoWithPath,
+use nix_remote::{stderr, NarHash, NixString, StorePath, StorePathSet, ValidPathInfoWithPath};
+use nix_rev2::{
+    blob, blob_cloned, blob_request, default_properties, digest, download_blob, download_proto,
+    upload_blob, upload_proto, Blob,
 };
 use prost::Message;
-use ring::{
-    digest::{Context, SHA256},
-    hkdf::HKDF_SHA256,
-};
-use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
-use tonic::transport::{Channel, Endpoint};
-use uuid::Uuid;
 
-use crate::generated::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
-use crate::generated::build::bazel::remote::execution::v2::{
-    batch_update_blobs_request::Request, BatchReadBlobsRequest, BatchUpdateBlobsRequest, Digest,
-    FindMissingBlobsRequest,
+use serde::{Deserialize, Serialize};
+use tonic::transport::{Channel, Endpoint};
+
+use nix_rev2::generated::{
+    self,
+    build::bazel::remote::execution::v2::{
+        action_cache_client::ActionCacheClient,
+        content_addressable_storage_client::ContentAddressableStorageClient,
+        execution_client::ExecutionClient, Action, ActionResult, Command, Digest, Directory,
+        DirectoryNode, ExecuteRequest, ExecuteResponse, ExecutedActionMetadata, FileNode,
+        FindMissingBlobsRequest, GetActionResultRequest, OutputDirectory, OutputFile, SymlinkNode,
+        Tree, UpdateActionResultRequest,
+    },
+    google::bytestream::byte_stream_client::ByteStreamClient,
 };
-use crate::generated::build::bazel::remote::execution::v2::{
-    Action, ActionResult, Command, Directory, DirectoryNode, ExecuteOperationMetadata,
-    ExecuteRequest, ExecuteResponse, ExecutedActionMetadata, GetActionResultRequest, SymlinkNode,
-    UpdateActionResultRequest,
-};
-use crate::generated::google::bytestream::WriteRequest;
 
 //const KEY = env!("BUILDBUDDY_API_KEY");
-
-#[derive(serde::Deserialize, Debug)]
-struct AddMultipleToStoreData {
-    data: Vec<(ValidPathInfoWithPath, Nar)>,
-}
-
-const METADATA_PATH: &str = "outputmetadata";
-const INSTANCE: &str = "my-instance";
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OutputMetadata {
-    references: Vec<StorePath>,
-    nar_hash: NixString,
-    nar_size: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BuildMetadata {
-    // The key is the output name, like "bin"
-    metadata: HashMap<NixString, OutputMetadata>,
-}
-
-struct Blob {
-    data: Vec<u8>,
-    digest: Digest,
-}
-
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-enum PathType {
+pub enum PathType {
     File { executable: bool },
     Directory,
 }
 
 #[derive(Debug, Clone)]
-struct PathInfo {
-    digest: Digest,
-    ty: PathType,
+pub enum PathInfo {
+    File {
+        digest: Digest,
+        executable: bool,
+    },
+    Directory {
+        root_digest: DirectoryDigest,
+        tree_digest: TreeDigest,
+    },
 }
 
-fn digest(data: &[u8]) -> Digest {
-    let mut ctx = Context::new(&SHA256);
-    ctx.update(data);
-    let digest = ctx.finish();
-    let hash_parts: Vec<_> = digest.as_ref().iter().map(|c| format!("{c:02x}")).collect();
-    let hash: String = hash_parts.iter().flat_map(|c| c.chars()).collect();
-    Digest {
-        hash,
-        size_bytes: data.len() as i64,
+impl PathInfo {
+    pub fn is_file(&self) -> bool {
+        match self {
+            PathInfo::File { digest, executable } => true,
+            PathInfo::Directory {
+                root_digest,
+                tree_digest,
+            } => false,
+        }
     }
 }
 
-fn default_properties(executable: bool) -> NodeProperties {
-    NodeProperties {
-        properties: vec![],
-        mtime: Some(prost_types::Timestamp {
-            seconds: 0,
-            nanos: 0,
-        }),
-        unix_mode: Some(if executable { 0o444 } else { 0o555 }),
-    }
-}
+#[derive(Debug, Clone)]
+pub struct TreeDigest(pub Digest);
 
-fn blob_cloned(data: impl AsRef<[u8]>) -> (Blob, Digest) {
-    blob(data.as_ref().to_owned())
-}
+#[derive(Debug, Clone)]
+pub struct DirectoryDigest(pub Digest);
 
-fn blob(data: Vec<u8>) -> (Blob, Digest) {
-    let digest = digest(&data);
-    (
-        Blob {
-            digest: digest.clone(),
-            data,
-        },
-        digest,
-    )
-}
+// TODO: we can make it typed
+//pub struct TypedDigest<T: Message>(pub Digest);
 
-fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
+pub fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
     let mut blobs = Vec::new();
 
     fn convert_file_rec(file: &NarFile, acc: &mut Vec<Blob>) -> Digest {
@@ -161,7 +111,11 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
         digest
     }
 
-    fn convert_dir_rec(entries: &[NarDirectoryEntry], acc: &mut Vec<Blob>) -> Digest {
+    fn convert_dir_rec(
+        entries: &[NarDirectoryEntry],
+        acc: &mut Vec<Blob>,
+        dir_acc: &mut Vec<Directory>,
+    ) -> (Directory, Digest) {
         let mut files = Vec::new();
         let mut symlinks = Vec::new();
         let mut directories = Vec::new();
@@ -191,7 +145,8 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
                     symlinks.push(node);
                 }
                 Nar::Directory(entries) => {
-                    let digest = convert_dir_rec(entries, acc);
+                    let (dir, digest) = convert_dir_rec(entries, acc, dir_acc);
+                    dir_acc.push(dir);
                     let node = DirectoryNode {
                         name,
                         digest: Some(digest),
@@ -209,107 +164,55 @@ fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
         };
         let (blob, digest) = blob(dir.encode_to_vec());
         acc.push(blob);
-        digest
+        (dir, digest)
     }
 
-    let (digest, ty) = match nar {
-        Nar::Contents(file) => (
-            convert_file_rec(file, &mut blobs),
-            PathType::File {
+    let info = match nar {
+        Nar::Contents(file) => {
+            (PathInfo::File {
                 executable: file.executable,
-            },
-        ),
+                digest: convert_file_rec(file, &mut blobs),
+            })
+        }
         Nar::Target(_) => panic!("symlink at top level!"),
-        Nar::Directory(entries) => (convert_dir_rec(entries, &mut blobs), PathType::Directory),
+        Nar::Directory(entries) => {
+            let mut dir_acc = Vec::new();
+            let (dir, digest) = convert_dir_rec(entries, &mut blobs, &mut dir_acc);
+            let tree = Tree {
+                root: Some(dir),
+                children: dir_acc,
+            };
+            let (tree_blob, tree_digest) = blob(tree.encode_to_vec());
+            blobs.push(tree_blob);
+            PathInfo::Directory {
+                root_digest: DirectoryDigest(digest),
+                tree_digest: TreeDigest(tree_digest),
+            }
+        }
     };
 
-    (blobs, PathInfo { digest, ty })
+    (blobs, info)
 }
 
-const CHUNK_SIZE: usize = 64 * 1024;
-
-// TODO: check if the blob is there already
-async fn upload_blob(client: &mut ByteStreamClient<Channel>, blob: Blob) -> anyhow::Result<()> {
-    // TODO: respect size limits by making actual streams
-    let uuid = Uuid::new_v4();
-    // let req = WriteRequest {
-    //     resource_name: format!(
-    //         "my-instance/uploads/{uuid}/blobs/{}/{}",
-    //         blob.digest.hash, blob.digest.size_bytes
-    //     ),
-    //     write_offset: 0,
-    //     finish_write: true,
-    //     data: blob.data,
-    // };
-    let mut chunks: Vec<_> = blob.data.chunks(CHUNK_SIZE).map(|c| c.to_owned()).collect();
-    let resource_name = format!(
-        "my-instance/uploads/{uuid}/blobs/{}/{}",
-        blob.digest.hash, blob.digest.size_bytes
-    );
-    let last_chunk = chunks.pop().unwrap_or(vec![]);
-    let requests = chunks
-        .into_iter()
-        .enumerate()
-        .map({
-            let resource_name = resource_name.clone();
-            move |(i, data)| WriteRequest {
-                resource_name: resource_name.clone(),
-                write_offset: (i * CHUNK_SIZE) as i64,
-                finish_write: false,
-                data,
-            }
-        })
-        .chain(std::iter::once(WriteRequest {
-            resource_name: resource_name.clone(),
-            write_offset: blob.digest.size_bytes - last_chunk.len() as i64,
-            finish_write: true,
-            data: last_chunk,
-        }));
-    dbg!(resource_name);
-    client.write(futures::stream::iter(requests)).await?;
-    Ok(())
+#[derive(serde::Deserialize, Debug)]
+struct AddMultipleToStoreData {
+    data: Vec<(ValidPathInfoWithPath, Nar)>,
 }
 
-async fn upload_proto<T: Message>(
-    client: &mut ByteStreamClient<Channel>,
-    data: &T,
-) -> anyhow::Result<Digest> {
-    let data = data.encode_to_vec();
-    let (blob, digest) = blob(data);
-    upload_blob(client, blob).await?;
-    Ok(digest)
+const METADATA_PATH: &str = "outputmetadata";
+const INSTANCE: &str = "my-instance";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutputMetadata {
+    references: Vec<StorePath>,
+    nar_hash: NixString,
+    nar_size: usize,
 }
 
-fn blob_request(digest: &Digest) -> ReadRequest {
-    let resource_name = format!("my-instance/blobs/{}/{}", digest.hash, digest.size_bytes);
-    ReadRequest {
-        resource_name,
-        read_offset: 0,
-        read_limit: 0,
-    }
-}
-
-async fn download_blob(
-    client: &mut ByteStreamClient<Channel>,
-    digest: &Digest,
-) -> anyhow::Result<Vec<u8>> {
-    let req = blob_request(digest);
-    let mut resp = client.read(req).await?.into_inner();
-    let mut buf = Vec::new();
-    while let Some(next) = resp.next().await {
-        let next = next?;
-        buf.extend_from_slice(&next.data);
-    }
-
-    Ok(buf)
-}
-
-async fn download_proto<T: prost::Message + Default>(
-    client: &mut ByteStreamClient<Channel>,
-    digest: &Digest,
-) -> anyhow::Result<T> {
-    let bytes = download_blob(client, digest).await?;
-    Ok(T::decode(bytes.as_ref())?)
+#[derive(Debug, Serialize, Deserialize)]
+struct BuildMetadata {
+    // The key is the output name, like "bin"
+    metadata: HashMap<NixString, OutputMetadata>,
 }
 
 fn build_input_root(
@@ -320,14 +223,14 @@ fn build_input_root(
         .input_sources
         .paths
         .iter()
-        .partition(|t| matches!(store_path_map.get(t).unwrap().ty, PathType::File { .. }));
+        .partition(|t| store_path_map.get(t).unwrap().is_file());
     let store_dir = Directory {
         files: files
             .into_iter()
             .map(|f| {
                 let info = store_path_map.get(f).unwrap();
-                let executable = match info.ty {
-                    PathType::File { executable } => executable,
+                let (executable, digest) = match info {
+                    PathInfo::File { executable, digest } => (executable, digest),
                     _ => unreachable!(),
                 };
                 FileNode {
@@ -336,21 +239,28 @@ fn build_input_root(
                         .strip_prefix("/nix/store/") // FIXME: look up the actual store path, and also adjust the directory tree building
                         .unwrap()
                         .to_owned(),
-                    digest: Some(info.digest.clone()),
-                    is_executable: executable,
-                    node_properties: Some(default_properties(executable)),
+                    digest: Some(digest.clone()),
+                    is_executable: *executable,
+                    node_properties: Some(default_properties(*executable)),
                 }
             })
             .collect(),
         directories: dirs
             .into_iter()
-            .map(|d| DirectoryNode {
-                name: String::from_utf8(d.as_ref().to_owned())
-                    .unwrap()
-                    .strip_prefix("/nix/store/") // FIXME: look up the actual store path, and also adjust the directory tree building
-                    .unwrap()
-                    .to_owned(),
-                digest: Some(store_path_map.get(d).unwrap().digest.clone()),
+            .map(|d| {
+                let root_digest = match store_path_map.get(d).unwrap() {
+                    PathInfo::File { .. } => panic!("cannot be file"),
+                    PathInfo::Directory { root_digest, .. } => root_digest,
+                };
+
+                DirectoryNode {
+                    name: String::from_utf8(d.as_ref().to_owned())
+                        .unwrap()
+                        .strip_prefix("/nix/store/") // FIXME: look up the actual store path, and also adjust the directory tree building
+                        .unwrap()
+                        .to_owned(),
+                    digest: Some(root_digest.0.clone()),
+                }
             })
             .collect(),
         symlinks: vec![],
@@ -415,11 +325,11 @@ fn build_input_root(
 async fn lookup_store_paths(
     cas_client: &mut ContentAddressableStorageClient<Channel>,
     ac_client: &mut ActionCacheClient<Channel>,
-    paths: &[NixString],
-) -> anyhow::Result<HashMap<NixString, Digest>> {
+    paths: &[StorePath],
+) -> anyhow::Result<HashMap<StorePath, PathInfo>> {
     let mut digest_map: HashMap<_, _> = paths
         .iter()
-        .map(|path| (path, store_path_action_digest(path.to_string().unwrap())))
+        .map(|path| (path, store_path_action_digest(path.0.to_string().unwrap())))
         .collect();
 
     let req = FindMissingBlobsRequest {
@@ -440,6 +350,7 @@ async fn lookup_store_paths(
     // TODO: be fancy
     let mut ret = HashMap::new();
     for (path, digest) in digest_map {
+        dbg!(&digest);
         let req = GetActionResultRequest {
             instance_name: INSTANCE.to_owned(),
             action_digest: Some(digest),
@@ -448,16 +359,21 @@ async fn lookup_store_paths(
             inline_output_files: vec![],
         };
         let action_result = ac_client.get_action_result(req).await?.into_inner();
-        if action_result.output_directories.len() != 1 {
+        let path_info = if let Some(dir) = action_result.output_directories.first() {
+            // FIXME root digest is currently same as tree digest.
+            PathInfo::Directory {
+                root_digest: DirectoryDigest(dir.tree_digest.clone().unwrap()),
+                tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
+            }
+        } else if let Some(file) = action_result.output_files.first() {
+            PathInfo::File {
+                digest: file.digest.clone().unwrap(),
+                executable: file.is_executable,
+            }
+        } else {
             panic!("what?");
-        }
-        ret.insert(
-            path.clone(),
-            action_result.output_directories[0]
-                .tree_digest
-                .clone()
-                .unwrap(),
-        );
+        };
+        ret.insert(path.clone(), path_info);
     }
     Ok(ret)
 }
@@ -468,7 +384,7 @@ fn store_path_action_digest(store_path: String) -> Digest {
         environment_variables: vec![],
         output_files: vec![],
         output_directories: vec![],
-        output_paths: vec![],
+        output_paths: vec!["store-path".into()],
         platform: None,
         working_directory: String::new(),
         output_node_properties: vec![],
@@ -488,23 +404,49 @@ fn store_path_action_digest(store_path: String) -> Digest {
 
 // Use this when the store path has already been uploaded to the CAS. root_digest is the digest of the store path's root directory
 // (well, not actually the store path's root directory: it points at a directory called "nix", which contains "store" etc)
+// FIXME: there is something wrong with the digest that's being passed in info. In the debug.rs binary, using
+// the exact same digest causes a deserialization error, but running the same code with basically any other digest works fine.
+// There isn't anything wrong with the digest length or anything; it seems like the digest is pointing to something bad in
+// the CAS and it causes problems. If we put in a digest that isn't in the CAS, it gives some other error about being unable
+// to find it. So, bb must be "dereferencing" the digest for some reason
 async fn add_store_path(
     ac_client: &mut ActionCacheClient<Channel>,
     bs_client: &mut ByteStreamClient<Channel>,
     store_path: String,
-    root_digest: Digest,
+    info: PathInfo,
 ) -> anyhow::Result<()> {
     let cmd = Command {
         arguments: vec![store_path],
         environment_variables: vec![],
         output_files: vec![],
         output_directories: vec![],
-        output_paths: vec![],
+        output_paths: vec!["store-path".into()],
         platform: None,
         working_directory: String::new(),
         output_node_properties: vec![],
     };
     let cmd_digest = upload_proto(bs_client, &cmd).await?;
+
+    let root_dir = Directory {
+        files: vec![],
+        directories: vec![],
+        symlinks: vec![],
+        node_properties: Some(default_properties(true)),
+    };
+    let (root_dir_blob, root_dir_digest) = blob(root_dir.encode_to_vec());
+    upload_blob(bs_client, root_dir_blob).await?;
+
+    let root_tree = Tree {
+        root: Some(Directory {
+            files: root_dir.files.clone(),
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        }),
+        children: vec![],
+    };
+    let (root_tree_blob, root_tree_digest) = blob(root_tree.encode_to_vec());
+    upload_blob(bs_client, root_tree_blob).await.unwrap();
 
     let action = Action {
         command_digest: Some(cmd_digest),
@@ -514,16 +456,37 @@ async fn add_store_path(
         salt: vec![],
         platform: None, // question: should we set something here to ensure that no one accidentally executes this action?
     };
+    dbg!(&action);
     let action_digest = upload_proto(bs_client, &action).await?;
 
+    let (output_files, output_directories) = match info {
+        PathInfo::File { executable, digest } => (
+            vec![OutputFile {
+                path: "store-path".into(),
+                digest: Some(digest.clone()),
+                is_executable: executable,
+                contents: vec![],
+                node_properties: None,
+            }],
+            vec![],
+        ),
+        PathInfo::Directory { tree_digest, .. } => (
+            vec![],
+            vec![OutputDirectory {
+                path: "store-path".into(),
+                tree_digest: Some(tree_digest.0.clone()),
+                //tree_digest: Some(root_dir_digest.clone()), // FIXME
+            }],
+        ),
+    };
+    dbg!(&root_dir_digest);
+    dbg!(&output_directories);
+
     let action_result = ActionResult {
-        output_files: vec![],
+        output_files,
         output_file_symlinks: vec![],
         output_symlinks: vec![],
-        output_directories: vec![OutputDirectory {
-            path: String::new(),
-            tree_digest: Some(root_digest),
-        }],
+        output_directories,
         output_directory_symlinks: vec![],
         exit_code: 0,
         stdout_raw: vec![],
@@ -546,12 +509,22 @@ async fn add_store_path(
 
     let req = UpdateActionResultRequest {
         instance_name: "my-instance".to_owned(),
-        action_digest: Some(action_digest),
+        action_digest: Some(action_digest.clone()),
         action_result: Some(action_result),
         results_cache_policy: None,
     };
 
     ac_client.update_action_result(req).await?;
+
+    // FIXME: this shouldn't be here, but we added it to debug the issue above
+    let req = GetActionResultRequest {
+        instance_name: INSTANCE.to_owned(),
+        action_digest: Some(action_digest),
+        inline_stdout: false,
+        inline_stderr: false,
+        inline_output_files: vec![],
+    };
+    dbg!(ac_client.get_action_result(req).await?.into_inner());
 
     Ok(())
 }
@@ -570,11 +543,10 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await
         .unwrap();
-    //let mut cas_client = ContentAddressableStorageClient::new(channel.clone());
     let mut exec_client = ExecutionClient::new(channel.clone());
     let mut ac_client = ActionCacheClient::new(channel.clone());
-    let mut bs_client = ByteStreamClient::new(channel);
-    let mut store_path_map = HashMap::new();
+    let mut bs_client = ByteStreamClient::new(channel.clone());
+    let mut cas_client = ContentAddressableStorageClient::new(channel);
     eprintln!("Connected to CAS");
 
     let mut nix = NixProxy::new(std::io::stdin(), std::io::stdout());
@@ -584,26 +556,22 @@ async fn main() -> anyhow::Result<()> {
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
 
-    let mut queried_already = false;
-    let mut known_paths: HashMap<StorePath, Digest> = HashMap::new();
     let mut built_paths: HashMap<StorePath, BuiltPath> = HashMap::new();
 
     while let Some(op) = nix.next_op()? {
         eprintln!("read op {op:?}");
         match op {
             WorkerOp::QueryValidPaths(op, resp) => {
-                dbg!(op);
-                // TODO:
-                // lookup_store_paths(&mut cas_client, &mut ac_client, op)
-                if !queried_already {
-                    queried_already = true;
-                    let reply = resp.ty(StorePathSet { paths: Vec::new() });
-                    nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
-                    nix.write.inner.write_nix(&reply)?;
-                    nix.write.inner.flush()?;
-                } else {
-                    panic!()
-                }
+                dbg!(&op);
+                let found_paths =
+                    lookup_store_paths(&mut cas_client, &mut ac_client, &op.paths.paths).await?;
+
+                let reply = resp.ty(StorePathSet {
+                    paths: found_paths.into_keys().collect(),
+                });
+                nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
+                nix.write.inner.write_nix(&reply)?;
+                nix.write.inner.flush()?;
             }
             WorkerOp::QueryPathInfo(path, resp) => {
                 let Some(BuiltPath {
@@ -653,7 +621,6 @@ async fn main() -> anyhow::Result<()> {
                 let data: AddMultipleToStoreData = Cursor::new(buf).read_nix()?;
                 for (path, nar) in data.data {
                     let (blobs, root_info) = convert(&nar);
-                    store_path_map.insert(path.path.clone(), root_info.clone());
                     for blob in blobs {
                         upload_blob(&mut bs_client, blob).await?;
                     }
@@ -661,7 +628,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut ac_client,
                         &mut bs_client,
                         path.path.0.to_string().unwrap(),
-                        root_info.digest.clone(),
+                        root_info,
                     )
                     .await?;
                 }
@@ -671,6 +638,12 @@ async fn main() -> anyhow::Result<()> {
             }
             WorkerOp::BuildDerivation(op, _resp) => {
                 dbg!(&op);
+                let store_path_map = lookup_store_paths(
+                    &mut cas_client,
+                    &mut ac_client,
+                    &op.0.derivation.input_sources.paths,
+                )
+                .await?;
                 let (blobs, input_digest) = build_input_root(&store_path_map, &op.0.derivation);
                 for blob in blobs {
                     upload_blob(&mut bs_client, blob).await?;
@@ -772,9 +745,10 @@ async fn main() -> anyhow::Result<()> {
                                 .iter()
                                 .find(|d| d.path.as_bytes() == output_store_path)
                             {
-                                PathInfo {
-                                    digest: dir.tree_digest.clone().unwrap(),
-                                    ty: PathType::Directory,
+                                // FIXME root digest is currently the same as tree digest. need to fetch the specific root dir digest
+                                PathInfo::Directory {
+                                    root_digest: DirectoryDigest(dir.tree_digest.clone().unwrap()),
+                                    tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
                                 }
                             } else {
                                 let file = action_result
@@ -782,11 +756,9 @@ async fn main() -> anyhow::Result<()> {
                                     .iter()
                                     .find(|f| f.path.as_bytes() == output_store_path)
                                     .unwrap();
-                                PathInfo {
+                                PathInfo::File {
                                     digest: file.digest.clone().unwrap(),
-                                    ty: PathType::File {
-                                        executable: file.is_executable,
-                                    },
+                                    executable: file.is_executable,
                                 }
                             };
                             built_paths.insert(
@@ -826,17 +798,18 @@ async fn main() -> anyhow::Result<()> {
             WorkerOp::NarFromPath(op, _resp) => {
                 let BuiltPath { info, .. } = built_paths.get(&op).unwrap();
 
-                let nar = match info.ty {
-                    PathType::File { executable } => {
-                        let file_contents = download_blob(&mut bs_client, &info.digest).await?;
+                let nar = match info {
+                    PathInfo::File { executable, digest } => {
+                        let file_contents = download_blob(&mut bs_client, digest).await?;
                         Nar::Contents(NarFile {
                             contents: file_contents.into(),
-                            executable,
+                            executable: *executable,
                         })
                     }
-                    PathType::Directory => {
-                        let tree: Tree =
-                            download_proto(&mut bs_client, &info.digest).await.unwrap();
+                    PathInfo::Directory { tree_digest, .. } => {
+                        let tree: Tree = download_proto(&mut bs_client, &tree_digest.0)
+                            .await
+                            .unwrap();
 
                         dbg!(&tree);
                         let flattened = flatten_tree(&tree);
