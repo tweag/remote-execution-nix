@@ -84,11 +84,8 @@ pub enum PathInfo {
 impl PathInfo {
     pub fn is_file(&self) -> bool {
         match self {
-            PathInfo::File { digest, executable } => true,
-            PathInfo::Directory {
-                root_digest,
-                tree_digest,
-            } => false,
+            PathInfo::File { .. } => true,
+            PathInfo::Directory { .. } => false,
         }
     }
 }
@@ -323,6 +320,7 @@ fn build_input_root(
 }
 
 async fn lookup_store_paths(
+    bs_client: &mut ByteStreamClient<Channel>,
     cas_client: &mut ContentAddressableStorageClient<Channel>,
     ac_client: &mut ActionCacheClient<Channel>,
     paths: &[StorePath],
@@ -347,22 +345,28 @@ async fn lookup_store_paths(
 
     digest_map.retain(|_path, digest| !missing.contains(&digest.hash));
 
-    // TODO: be fancy
     let mut ret = HashMap::new();
-    for (path, digest) in digest_map {
-        dbg!(&digest);
+    for (path, path_digest) in digest_map {
         let req = GetActionResultRequest {
             instance_name: INSTANCE.to_owned(),
-            action_digest: Some(digest),
+            action_digest: Some(path_digest),
             inline_stdout: false,
             inline_stderr: false,
             inline_output_files: vec![],
         };
-        let action_result = ac_client.get_action_result(req).await?.into_inner();
+        // TODO: better would be to treat NOT_FOUND specially
+        let action_result = match ac_client.get_action_result(req).await {
+            Ok(x) => x.into_inner(),
+            Err(e) => {
+                eprintln!("failed to get actionresult: {e}");
+                continue;
+            }
+        };
         let path_info = if let Some(dir) = action_result.output_directories.first() {
-            // FIXME root digest is currently same as tree digest.
+            let tree: Tree = download_proto(bs_client, dir.tree_digest.as_ref().unwrap()).await?;
+            let root_digest = digest(&tree.root.unwrap().encode_to_vec());
             PathInfo::Directory {
-                root_digest: DirectoryDigest(dir.tree_digest.clone().unwrap()),
+                root_digest: DirectoryDigest(root_digest),
                 tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
             }
         } else if let Some(file) = action_result.output_files.first() {
@@ -381,34 +385,20 @@ async fn lookup_store_paths(
 fn store_path_action_digest(store_path: String) -> Digest {
     let cmd = Command {
         arguments: vec![store_path],
-        environment_variables: vec![],
-        output_files: vec![],
-        output_directories: vec![],
         output_paths: vec!["store-path".into()],
-        platform: None,
-        working_directory: String::new(),
-        output_node_properties: vec![],
+        ..Default::default()
     };
     let cmd_digest = digest(&cmd.encode_to_vec());
 
     let action = Action {
         command_digest: Some(cmd_digest),
-        input_root_digest: None,
-        timeout: None,
-        do_not_cache: false,
-        salt: vec![],
-        platform: None, // question: should we set something here to ensure that no one accidentally executes this action?
+        ..Default::default()
     };
     digest(&action.encode_to_vec())
 }
 
 // Use this when the store path has already been uploaded to the CAS. root_digest is the digest of the store path's root directory
 // (well, not actually the store path's root directory: it points at a directory called "nix", which contains "store" etc)
-// FIXME: there is something wrong with the digest that's being passed in info. In the debug.rs binary, using
-// the exact same digest causes a deserialization error, but running the same code with basically any other digest works fine.
-// There isn't anything wrong with the digest length or anything; it seems like the digest is pointing to something bad in
-// the CAS and it causes problems. If we put in a digest that isn't in the CAS, it gives some other error about being unable
-// to find it. So, bb must be "dereferencing" the digest for some reason
 async fn add_store_path(
     ac_client: &mut ActionCacheClient<Channel>,
     bs_client: &mut ByteStreamClient<Channel>,
@@ -417,46 +407,15 @@ async fn add_store_path(
 ) -> anyhow::Result<()> {
     let cmd = Command {
         arguments: vec![store_path],
-        environment_variables: vec![],
-        output_files: vec![],
-        output_directories: vec![],
         output_paths: vec!["store-path".into()],
-        platform: None,
-        working_directory: String::new(),
-        output_node_properties: vec![],
+        ..Default::default()
     };
     let cmd_digest = upload_proto(bs_client, &cmd).await?;
 
-    let root_dir = Directory {
-        files: vec![],
-        directories: vec![],
-        symlinks: vec![],
-        node_properties: Some(default_properties(true)),
-    };
-    let (root_dir_blob, root_dir_digest) = blob(root_dir.encode_to_vec());
-    upload_blob(bs_client, root_dir_blob).await?;
-
-    let root_tree = Tree {
-        root: Some(Directory {
-            files: root_dir.files.clone(),
-            directories: vec![],
-            symlinks: vec![],
-            node_properties: None,
-        }),
-        children: vec![],
-    };
-    let (root_tree_blob, root_tree_digest) = blob(root_tree.encode_to_vec());
-    upload_blob(bs_client, root_tree_blob).await.unwrap();
-
     let action = Action {
         command_digest: Some(cmd_digest),
-        input_root_digest: None,
-        timeout: None,
-        do_not_cache: false,
-        salt: vec![],
-        platform: None, // question: should we set something here to ensure that no one accidentally executes this action?
+        ..Default::default()
     };
-    dbg!(&action);
     let action_digest = upload_proto(bs_client, &action).await?;
 
     let (output_files, output_directories) = match info {
@@ -475,36 +434,18 @@ async fn add_store_path(
             vec![OutputDirectory {
                 path: "store-path".into(),
                 tree_digest: Some(tree_digest.0.clone()),
-                //tree_digest: Some(root_dir_digest.clone()), // FIXME
             }],
         ),
     };
-    dbg!(&root_dir_digest);
-    dbg!(&output_directories);
 
     let action_result = ActionResult {
         output_files,
-        output_file_symlinks: vec![],
-        output_symlinks: vec![],
         output_directories,
-        output_directory_symlinks: vec![],
-        exit_code: 0,
-        stdout_raw: vec![],
-        stdout_digest: None,
-        stderr_raw: vec![],
-        stderr_digest: None,
         execution_metadata: Some(ExecutedActionMetadata {
             worker: "Nix store upload".to_owned(),
-            queued_timestamp: None,
-            worker_start_timestamp: None,
-            worker_completed_timestamp: None,
-            input_fetch_start_timestamp: None,
-            input_fetch_completed_timestamp: None,
-            execution_start_timestamp: None,
-            execution_completed_timestamp: None,
-            output_upload_start_timestamp: None,
-            output_upload_completed_timestamp: None,
+            ..Default::default()
         }),
+        ..Default::default()
     };
 
     let req = UpdateActionResultRequest {
@@ -515,16 +456,6 @@ async fn add_store_path(
     };
 
     ac_client.update_action_result(req).await?;
-
-    // FIXME: this shouldn't be here, but we added it to debug the issue above
-    let req = GetActionResultRequest {
-        instance_name: INSTANCE.to_owned(),
-        action_digest: Some(action_digest),
-        inline_stdout: false,
-        inline_stderr: false,
-        inline_output_files: vec![],
-    };
-    dbg!(ac_client.get_action_result(req).await?.into_inner());
 
     Ok(())
 }
@@ -563,8 +494,13 @@ async fn main() -> anyhow::Result<()> {
         match op {
             WorkerOp::QueryValidPaths(op, resp) => {
                 dbg!(&op);
-                let found_paths =
-                    lookup_store_paths(&mut cas_client, &mut ac_client, &op.paths.paths).await?;
+                let found_paths = lookup_store_paths(
+                    &mut bs_client,
+                    &mut cas_client,
+                    &mut ac_client,
+                    &op.paths.paths,
+                )
+                .await?;
 
                 let reply = resp.ty(StorePathSet {
                     paths: found_paths.into_keys().collect(),
@@ -617,7 +553,6 @@ async fn main() -> anyhow::Result<()> {
                     acc.extend_from_slice(&data);
                     acc
                 });
-                dbg!(buf.len(), &buf[0..128]);
                 let data: AddMultipleToStoreData = Cursor::new(buf).read_nix()?;
                 for (path, nar) in data.data {
                     let (blobs, root_info) = convert(&nar);
@@ -639,6 +574,7 @@ async fn main() -> anyhow::Result<()> {
             WorkerOp::BuildDerivation(op, _resp) => {
                 dbg!(&op);
                 let store_path_map = lookup_store_paths(
+                    &mut bs_client,
                     &mut cas_client,
                     &mut ac_client,
                     &op.0.derivation.input_sources.paths,
@@ -745,9 +681,14 @@ async fn main() -> anyhow::Result<()> {
                                 .iter()
                                 .find(|d| d.path.as_bytes() == output_store_path)
                             {
-                                // FIXME root digest is currently the same as tree digest. need to fetch the specific root dir digest
+                                let tree: Tree = download_proto(
+                                    &mut bs_client,
+                                    dir.tree_digest.as_ref().unwrap(),
+                                )
+                                .await?;
+                                let root_digest = digest(&tree.root.unwrap().encode_to_vec());
                                 PathInfo::Directory {
-                                    root_digest: DirectoryDigest(dir.tree_digest.clone().unwrap()),
+                                    root_digest: DirectoryDigest(root_digest),
                                     tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
                                 }
                             } else {
@@ -811,7 +752,6 @@ async fn main() -> anyhow::Result<()> {
                             .await
                             .unwrap();
 
-                        dbg!(&tree);
                         let flattened = flatten_tree(&tree);
 
                         let mut nar = Nar::default();
