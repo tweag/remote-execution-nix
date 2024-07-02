@@ -1,10 +1,4 @@
-// In the middle of doing:
-// we build action cache entries for each store path, and upload them on AddMultipleToStore
 // TODO:
-// - There are two places where we are faking the root directory digest of a PathInfo by passing in the tree digest.
-//   We should be making an additional call to the CAS and fetching the correct directory digest
-// - also check for them in QueryValidPaths
-// - in BuildDerivation, lookup the cached digests. Stop using the in-memory thing
 // - register built paths also. Don't forget to wrap in nix/store/...
 
 // TODO:
@@ -42,7 +36,7 @@ use nix_remote::{nar::Nar, NixProxy, NixReadExt, NixWriteExt};
 use nix_remote::{stderr, NarHash, NixString, StorePath, StorePathSet, ValidPathInfoWithPath};
 use nix_rev2::{
     blob, blob_cloned, blob_request, default_properties, digest, download_blob, download_proto,
-    upload_blob, upload_proto, Blob,
+    protoblob, upload_blob, upload_proto, Blob, TypedDigest,
 };
 use prost::Message;
 
@@ -76,8 +70,8 @@ pub enum PathInfo {
         executable: bool,
     },
     Directory {
-        root_digest: DirectoryDigest,
-        tree_digest: TreeDigest,
+        root_digest: TypedDigest<Directory>,
+        tree_digest: TypedDigest<Tree>,
     },
 }
 
@@ -90,14 +84,18 @@ impl PathInfo {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TreeDigest(pub Digest);
+pub async fn path_info_from_tree(
+    bs_client: &mut ByteStreamClient<Channel>,
+    tree_digest: TypedDigest<Tree>,
+) -> anyhow::Result<PathInfo> {
+    let tree: Tree = download_proto(bs_client, &tree_digest).await?;
+    let root_digest = TypedDigest::from_message(&tree.root.unwrap());
 
-#[derive(Debug, Clone)]
-pub struct DirectoryDigest(pub Digest);
-
-// TODO: we can make it typed
-//pub struct TypedDigest<T: Message>(pub Digest);
+    Ok(PathInfo::Directory {
+        root_digest,
+        tree_digest,
+    })
+}
 
 pub fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
     let mut blobs = Vec::new();
@@ -112,7 +110,7 @@ pub fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
         entries: &[NarDirectoryEntry],
         acc: &mut Vec<Blob>,
         dir_acc: &mut Vec<Directory>,
-    ) -> (Directory, Digest) {
+    ) -> (Directory, TypedDigest<Directory>) {
         let mut files = Vec::new();
         let mut symlinks = Vec::new();
         let mut directories = Vec::new();
@@ -146,7 +144,7 @@ pub fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
                     dir_acc.push(dir);
                     let node = DirectoryNode {
                         name,
-                        digest: Some(digest),
+                        digest: Some(digest.0),
                     };
                     directories.push(node);
                 }
@@ -159,31 +157,29 @@ pub fn convert(nar: &Nar) -> (Vec<Blob>, PathInfo) {
             symlinks,
             node_properties: Some(default_properties(true)),
         };
-        let (blob, digest) = blob(dir.encode_to_vec());
+        let (blob, digest) = protoblob(&dir);
         acc.push(blob);
         (dir, digest)
     }
 
     let info = match nar {
-        Nar::Contents(file) => {
-            (PathInfo::File {
-                executable: file.executable,
-                digest: convert_file_rec(file, &mut blobs),
-            })
-        }
+        Nar::Contents(file) => PathInfo::File {
+            executable: file.executable,
+            digest: convert_file_rec(file, &mut blobs),
+        },
         Nar::Target(_) => panic!("symlink at top level!"),
         Nar::Directory(entries) => {
             let mut dir_acc = Vec::new();
-            let (dir, digest) = convert_dir_rec(entries, &mut blobs, &mut dir_acc);
+            let (dir, root_digest) = convert_dir_rec(entries, &mut blobs, &mut dir_acc);
             let tree = Tree {
                 root: Some(dir),
                 children: dir_acc,
             };
-            let (tree_blob, tree_digest) = blob(tree.encode_to_vec());
+            let (tree_blob, tree_digest) = protoblob(&tree);
             blobs.push(tree_blob);
             PathInfo::Directory {
-                root_digest: DirectoryDigest(digest),
-                tree_digest: TreeDigest(tree_digest),
+                root_digest,
+                tree_digest,
             }
         }
     };
@@ -363,12 +359,11 @@ async fn lookup_store_paths(
             }
         };
         let path_info = if let Some(dir) = action_result.output_directories.first() {
-            let tree: Tree = download_proto(bs_client, dir.tree_digest.as_ref().unwrap()).await?;
-            let root_digest = digest(&tree.root.unwrap().encode_to_vec());
-            PathInfo::Directory {
-                root_digest: DirectoryDigest(root_digest),
-                tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
-            }
+            path_info_from_tree(
+                bs_client,
+                TypedDigest::new(dir.tree_digest.clone().unwrap()),
+            )
+            .await?
         } else if let Some(file) = action_result.output_files.first() {
             PathInfo::File {
                 digest: file.digest.clone().unwrap(),
@@ -413,7 +408,7 @@ async fn add_store_path(
     let cmd_digest = upload_proto(bs_client, &cmd).await?;
 
     let action = Action {
-        command_digest: Some(cmd_digest),
+        command_digest: Some(cmd_digest.0),
         ..Default::default()
     };
     let action_digest = upload_proto(bs_client, &action).await?;
@@ -450,7 +445,7 @@ async fn add_store_path(
 
     let req = UpdateActionResultRequest {
         instance_name: "my-instance".to_owned(),
-        action_digest: Some(action_digest.clone()),
+        action_digest: Some(action_digest.0.clone()),
         action_result: Some(action_result),
         results_cache_policy: None,
     };
@@ -681,16 +676,11 @@ async fn main() -> anyhow::Result<()> {
                                 .iter()
                                 .find(|d| d.path.as_bytes() == output_store_path)
                             {
-                                let tree: Tree = download_proto(
+                                path_info_from_tree(
                                     &mut bs_client,
-                                    dir.tree_digest.as_ref().unwrap(),
+                                    TypedDigest::new(dir.tree_digest.clone().unwrap()),
                                 )
-                                .await?;
-                                let root_digest = digest(&tree.root.unwrap().encode_to_vec());
-                                PathInfo::Directory {
-                                    root_digest: DirectoryDigest(root_digest),
-                                    tree_digest: TreeDigest(dir.tree_digest.clone().unwrap()),
-                                }
+                                .await?
                             } else {
                                 let file = action_result
                                     .output_files
@@ -748,9 +738,7 @@ async fn main() -> anyhow::Result<()> {
                         })
                     }
                     PathInfo::Directory { tree_digest, .. } => {
-                        let tree: Tree = download_proto(&mut bs_client, &tree_digest.0)
-                            .await
-                            .unwrap();
+                        let tree: Tree = download_proto(&mut bs_client, tree_digest).await.unwrap();
 
                         let flattened = flatten_tree(&tree);
 
@@ -773,57 +761,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    // let data = "Hello, world!";
-    // let mut ctx = Context::new(&SHA256);
-    // ctx.update(data.as_bytes());
-    // let digest = ctx.finish();
-    // assert_eq!(digest.as_ref().len(), 32);
-    // let hash_parts: Vec<_> = digest.as_ref().iter().map(|c| format!("{c:02x}")).collect();
-    // assert_eq!(hash_parts.len(), 32);
-    // dbg!(&hash_parts);
-    // let hash: String = hash_parts.iter().flat_map(|c| c.chars()).collect();
-    // assert_eq!(hash.len(), 64);
-    // dbg!(&hash);
-    // let result = cas_client
-    //     .batch_update_blobs(BatchUpdateBlobsRequest {
-    //         instance_name: "".to_owned(),
-    //         requests: vec![Request {
-    //             digest: Some(Digest {
-    //                 hash: hash.clone(),
-    //                 size_bytes: data.len() as i64,
-    //             }),
-    //             data: data.as_bytes().to_vec(),
-    //         }],
-    //     })
-    //     .await
-    //     .unwrap();
-    // dbg!(result);
-    // let result = cas_client
-    //     .find_missing_blobs(FindMissingBlobsRequest {
-    //         instance_name: "".to_owned(),
-    //         blob_digests: vec![Digest {
-    //             hash: hash.clone(),
-    //             size_bytes: data.len() as i64,
-    //         }],
-    //     })
-    //     .await
-    //     .unwrap();
-
-    // dbg!(result);
-
-    // let result = cas_client
-    //     .batch_read_blobs(BatchReadBlobsRequest {
-    //         instance_name: "".to_owned(),
-    //         digests: vec![Digest {
-    //             hash,
-    //             size_bytes: data.len() as i64,
-    //         }],
-    //     })
-    //     .await
-    //     .unwrap();
-
-    // dbg!(result);
 
     Ok(())
 }
