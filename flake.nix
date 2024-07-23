@@ -41,7 +41,8 @@
         packages.test = pkgs.stdenv.mkDerivation {
           pname = "test";
           version = "0.0.1";
-          src = ./.;
+          #src = ./.;
+          dontUnpack = true;
 
 
           installPhase = ''
@@ -65,6 +66,23 @@
             echo "World" >&2
             chmod +x $out
             echo "on stdout"
+          '';
+        };
+
+        packages.test-slow = pkgs.stdenv.mkDerivation {
+          pname = "test-slow";
+          version = "0.0.1";
+          #src = ./.;
+          dontUnpack = true;
+
+          installPhase = ''
+            echo "Hello" >&2
+            echo "World" >&2
+            echo not the current time > $out
+            chmod +x $out
+            echo "on stdout and sleeping"
+            sleep 60
+            echo "Done sleeping"
           '';
         };
       }

@@ -13,7 +13,7 @@ fn main() {
                 "build/bazel/remote/execution/v2/remote_execution.proto",
                 "google/bytestream/bytestream.proto",
             ],
-            &["proto/remote-apis-2.2.0", "proto/googleapis-master"],
+            &["proto/remote-apis", "proto/googleapis-master"],
         )
         .unwrap();
 }

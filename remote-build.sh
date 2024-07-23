@@ -11,14 +11,14 @@ TEST_ROOT=/home/jneeman/tweag/nix-rev2/test-remote-store
 #builder="ssh-ng://localhost?remote-store=$TEST_ROOT/remote?remote-program=/home/jneeman/tweag/nix-remote-rust/nix-remote-rust.sh - - 1 1 foo"
 builder="ssh-ng://localhost?remote-program=/home/jneeman/tweag/nix-rev2/nix-remote-rust.sh - - 1 1 foo"
 
-chmod -R +w $TEST_ROOT/remote || true
+#chmod -R +w $TEST_ROOT/remote || true
 #rm -rf $TEST_ROOT/remote/* || true
 chmod -R +w $TEST_ROOT/local || true
 #rm -rf $TEST_ROOT/local/* || true
 
 nix build -L -v -o result --max-jobs 0 \
- --option builders-use-substitutes true \
- .#test-file \
+ --builders-use-substitutes \
+ .#test-slow \
  --store $TEST_ROOT/local \
  --builders "$builder" --impure
 

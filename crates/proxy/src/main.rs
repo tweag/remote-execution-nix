@@ -1,5 +1,7 @@
 // TODO:
-// - register built paths also. Don't forget to wrap in nix/store/...
+// - register built paths also. Don't forget to wrap in nix/store/... *in progress*
+//   it looks like we'd need to upload all directory struct referred to in the output tree into the CAS to be able to construct a valid input root for dependent actions. This seems very weird and we suspect that we're missing something about the protocol.
+//   there's now a output_directory_format field in Command messages which may solve this problem. We need to regenerate the protobuf files
 
 // TODO:
 // - write a EntrySink impl for nix.write somehow, this will facilitate some streaming
@@ -21,6 +23,13 @@
 // - know all the references.
 // Our approach: build the nar on the fly and stream it. Have the builder precompute references and store them somewhere in the CAS.
 
+// Notes 2024-7-23:
+// - the output path isn't included in the QueryValidPaths op: if the client's nix store doesn't have the built derivation,
+//   it just asks the remote builder to build it. (It doesn't first check if the remote builder already has it.) This means
+//   that if we want a cache hit for the already-build derivations we need to handle that ourselves in BuildDerivation.
+// - If we want to do substitutions ourself, we should do it upon receiving QueryValidPaths. Then we should respond
+//   that we already have the substituted paths.
+
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::pin::Pin;
@@ -34,6 +43,7 @@ use nix_remote::worker_op::{
 };
 use nix_remote::{nar::Nar, NixProxy, NixReadExt, NixWriteExt};
 use nix_remote::{stderr, NarHash, NixString, StorePath, StorePathSet, ValidPathInfoWithPath};
+use nix_rev2::generated::build::bazel::remote::execution::v2::command::OutputDirectoryFormat;
 use nix_rev2::{
     blob, blob_cloned, blob_request, default_properties, digest, download_blob, download_proto,
     protoblob, upload_blob, upload_proto, Blob, TypedDigest,
@@ -329,6 +339,7 @@ async fn lookup_store_paths(
     let req = FindMissingBlobsRequest {
         instance_name: INSTANCE.to_owned(),
         blob_digests: digest_map.values().cloned().collect(),
+        digest_function: 0,
     };
     let missing: HashSet<_> = cas_client
         .find_missing_blobs(req)
@@ -349,6 +360,7 @@ async fn lookup_store_paths(
             inline_stdout: false,
             inline_stderr: false,
             inline_output_files: vec![],
+            digest_function: 0,
         };
         // TODO: better would be to treat NOT_FOUND specially
         let action_result = match ac_client.get_action_result(req).await {
@@ -424,11 +436,16 @@ async fn add_store_path(
             }],
             vec![],
         ),
-        PathInfo::Directory { tree_digest, .. } => (
+        PathInfo::Directory {
+            tree_digest,
+            root_digest,
+        } => (
             vec![],
             vec![OutputDirectory {
                 path: "store-path".into(),
                 tree_digest: Some(tree_digest.0.clone()),
+                is_topologically_sorted: false,
+                root_directory_digest: Some(root_digest.0.clone()),
             }],
         ),
     };
@@ -448,6 +465,7 @@ async fn add_store_path(
         action_digest: Some(action_digest.0.clone()),
         action_result: Some(action_result),
         results_cache_policy: None,
+        digest_function: 0,
     };
 
     ac_client.update_action_result(req).await?;
@@ -496,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
                     &op.paths.paths,
                 )
                 .await?;
+                dbg!(&found_paths);
 
                 let reply = resp.ty(StorePathSet {
                     paths: found_paths.into_keys().collect(),
@@ -579,14 +598,9 @@ async fn main() -> anyhow::Result<()> {
                 for blob in blobs {
                     upload_blob(&mut bs_client, blob).await?;
                 }
-                dbg!(&input_digest);
 
                 let cmd = Command {
-                    arguments: vec![
-                        // FIXME: build barn runs multiple executions in the same container! The /nix directory
-                        // will be preserved between runs. Maybe chroot is more reliable?
-                        "./drv-adapter".to_owned(),
-                    ],
+                    arguments: vec!["./drv-adapter".to_owned()],
                     environment_variables: vec![],
                     output_files: vec![],
                     output_directories: vec![],
@@ -595,14 +609,13 @@ async fn main() -> anyhow::Result<()> {
                         .derivation
                         .outputs
                         .iter()
-                        // We turn the absolute /nix/store/... path into a relative nix/store/... path because
-                        // bazel wants a relative path. They point to the same thing because /nix is a symlink to nix.
-                        .map(|out| out.1.store_path.0.to_string().unwrap()[1..].to_owned()) // yuck
+                        .map(|out| out.1.store_path.0.to_string().unwrap()[1..].to_owned())
                         .chain(std::iter::once(METADATA_PATH.to_owned()))
                         .collect(),
                     platform: None,
                     working_directory: "".to_owned(),
                     output_node_properties: vec![],
+                    output_directory_format: OutputDirectoryFormat::TreeAndDirectory.into(),
                 };
                 let (cmd_blob, cmd_digest) = blob(cmd.encode_to_vec());
                 upload_blob(&mut bs_client, cmd_blob).await?;
@@ -626,6 +639,10 @@ async fn main() -> anyhow::Result<()> {
                     action_digest: Some(action_digest),
                     execution_policy: None,
                     results_cache_policy: None,
+                    digest_function: 0,
+                    inline_stdout: false,
+                    inline_stderr: false,
+                    inline_output_files: vec![],
                 };
 
                 let mut results = exec_client.execute(req).await?.into_inner();
@@ -692,6 +709,13 @@ async fn main() -> anyhow::Result<()> {
                                     executable: file.is_executable,
                                 }
                             };
+                            add_store_path(
+                                &mut ac_client,
+                                &mut bs_client,
+                                output.1.store_path.0.to_string().unwrap(),
+                                info.clone(),
+                            )
+                            .await?;
                             built_paths.insert(
                                 StorePath(output.1.store_path.0.clone()),
                                 BuiltPath {
