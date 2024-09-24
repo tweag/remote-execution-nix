@@ -133,6 +133,15 @@ pub async fn upload_proto<T: Message>(
     Ok(TypedDigest(digest, std::marker::PhantomData))
 }
 
+pub async fn upload_proto_untyped(
+    client: &mut ByteStreamClient<Channel>,
+    data: Vec<u8>,
+) -> anyhow::Result<Digest> {
+    let (blob, digest) = blob(data);
+    upload_blob(client, blob).await?;
+    Ok(digest)
+}
+
 // pub async fn upload_proto<T: Message>(
 //     client: &mut ByteStreamClient<Channel>,
 //     data: &T,

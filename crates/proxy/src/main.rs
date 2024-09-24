@@ -46,7 +46,7 @@ use nix_remote::{stderr, NarHash, NixString, StorePath, StorePathSet, ValidPathI
 use nix_rev2::generated::build::bazel::remote::execution::v2::command::OutputDirectoryFormat;
 use nix_rev2::{
     blob, blob_cloned, blob_request, default_properties, digest, download_blob, download_proto,
-    protoblob, upload_blob, upload_proto, Blob, TypedDigest,
+    protoblob, upload_blob, upload_proto, upload_proto_untyped, Blob, TypedDigest,
 };
 use prost::Message;
 
@@ -325,12 +325,22 @@ fn build_input_root(
     )
 }
 
+async fn valid_path_info_from_digest(
+    bs_client: &mut ByteStreamClient<Channel>,
+    digest: &Digest,
+) -> anyhow::Result<ValidPathInfo> {
+    let blob = download_blob(bs_client, digest).await?;
+    Ok(blob.as_slice().read_nix()?)
+}
+
+// Given a collection of store paths, looks them up in the CAS (using the store-path-to-CA
+// mapping we're storing in the action cache) and returns a mapping of all found paths.
 async fn lookup_store_paths(
     bs_client: &mut ByteStreamClient<Channel>,
     cas_client: &mut ContentAddressableStorageClient<Channel>,
     ac_client: &mut ActionCacheClient<Channel>,
     paths: &[StorePath],
-) -> anyhow::Result<HashMap<StorePath, PathInfo>> {
+) -> anyhow::Result<HashMap<StorePath, (PathInfo, ValidPathInfo)>> {
     let mut digest_map: HashMap<_, _> = paths
         .iter()
         .map(|path| (path, store_path_action_digest(path.0.to_string().unwrap())))
@@ -370,13 +380,25 @@ async fn lookup_store_paths(
                 continue;
             }
         };
+        let valid_path_info_file = action_result
+            .output_files
+            .iter()
+            .find(|f| f.path == "valid-path-info")
+            .expect("huh?");
+        let valid_path_info =
+            valid_path_info_from_digest(bs_client, valid_path_info_file.digest.as_ref().unwrap())
+                .await?;
         let path_info = if let Some(dir) = action_result.output_directories.first() {
             path_info_from_tree(
                 bs_client,
                 TypedDigest::new(dir.tree_digest.clone().unwrap()),
             )
             .await?
-        } else if let Some(file) = action_result.output_files.first() {
+        } else if let Some(file) = action_result
+            .output_files
+            .iter()
+            .find(|f| f.path == "store-path")
+        {
             PathInfo::File {
                 digest: file.digest.clone().unwrap(),
                 executable: file.is_executable,
@@ -384,7 +406,7 @@ async fn lookup_store_paths(
         } else {
             panic!("what?");
         };
-        ret.insert(path.clone(), path_info);
+        ret.insert(path.clone(), (path_info, valid_path_info));
     }
     Ok(ret)
 }
@@ -410,6 +432,7 @@ async fn add_store_path(
     ac_client: &mut ActionCacheClient<Channel>,
     bs_client: &mut ByteStreamClient<Channel>,
     store_path: String,
+    path_info: ValidPathInfo,
     info: PathInfo,
 ) -> anyhow::Result<()> {
     let cmd = Command {
@@ -425,22 +448,36 @@ async fn add_store_path(
     };
     let action_digest = upload_proto(bs_client, &action).await?;
 
+    let mut path_info_data = Vec::new();
+    path_info_data.write_nix(&path_info)?;
+    let valid_path_info_digest = upload_proto_untyped(bs_client, path_info_data).await?;
+    let valid_path_info_file = OutputFile {
+        path: "valid-path-info".into(),
+        digest: Some(valid_path_info_digest),
+        is_executable: false,
+        contents: vec![],
+        node_properties: None,
+    };
+
     let (output_files, output_directories) = match info {
         PathInfo::File { executable, digest } => (
-            vec![OutputFile {
-                path: "store-path".into(),
-                digest: Some(digest.clone()),
-                is_executable: executable,
-                contents: vec![],
-                node_properties: None,
-            }],
+            vec![
+                OutputFile {
+                    path: "store-path".into(),
+                    digest: Some(digest.clone()),
+                    is_executable: executable,
+                    contents: vec![],
+                    node_properties: None,
+                },
+                valid_path_info_file,
+            ],
             vec![],
         ),
         PathInfo::Directory {
             tree_digest,
             root_digest,
         } => (
-            vec![],
+            vec![valid_path_info_file],
             vec![OutputDirectory {
                 path: "store-path".into(),
                 tree_digest: Some(tree_digest.0.clone()),
@@ -500,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
 
+    // TODO: get rid of this altogether in favor of the action cache
     let mut built_paths: HashMap<StorePath, BuiltPath> = HashMap::new();
 
     while let Some(op) = nix.next_op()? {
@@ -524,39 +562,22 @@ async fn main() -> anyhow::Result<()> {
                 nix.write.inner.flush()?;
             }
             WorkerOp::QueryPathInfo(path, resp) => {
-                let Some(BuiltPath {
-                    deriver,
-                    registration_time,
-                    build_metadata,
-                    ..
-                }) = built_paths.get(&path)
-                else {
-                    panic!("We don't know about the path {:?}", path);
+                let found_paths = lookup_store_paths(
+                    &mut bs_client,
+                    &mut cas_client,
+                    &mut ac_client,
+                    &[path.0.clone()],
+                )
+                .await?;
+                dbg!(&path, &found_paths);
+
+                let Some((_, valid_path_info)) = found_paths.get(&path) else {
+                    panic!("didn't know about path {}", path.0 .0.to_string().unwrap());
                 };
 
-                let metadata_blob = download_blob(&mut bs_client, build_metadata).await.unwrap();
-                let metadata: BuildMetadata = bincode::deserialize(&metadata_blob).unwrap();
-                dbg!(&metadata);
-                let OutputMetadata {
-                    references,
-                    nar_hash,
-                    nar_size,
-                } = metadata.metadata.get(&path.0 .0).unwrap();
-
-                let reply = QueryPathInfoResponse {
-                    path: Some(ValidPathInfo {
-                        deriver: deriver.clone(),
-                        hash: NarHash::from_bytes(nar_hash.as_ref()),
-                        references: StorePathSet {
-                            paths: references.clone(),
-                        },
-                        registration_time: *registration_time,
-                        nar_size: *nar_size as u64,
-                        ultimate: true,
-                        sigs: nix_remote::StringSet { paths: vec![] },
-                        content_address: NixString::default(),
-                    }),
-                };
+                let reply = resp.ty(QueryPathInfoResponse {
+                    path: Some(valid_path_info.clone()),
+                });
                 nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
                 nix.write.inner.write_nix(&reply)?;
                 nix.write.inner.flush()?;
@@ -577,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut ac_client,
                         &mut bs_client,
                         path.path.0.to_string().unwrap(),
+                        path.info,
                         root_info,
                     )
                     .await?;
@@ -594,6 +616,7 @@ async fn main() -> anyhow::Result<()> {
                     &op.0.derivation.input_sources.paths,
                 )
                 .await?;
+                let store_path_map = store_path_map.into_iter().map(|(k, v)| (k, v.0)).collect();
                 let (blobs, input_digest) = build_input_root(&store_path_map, &op.0.derivation);
                 for blob in blobs {
                     upload_blob(&mut bs_client, blob).await?;
@@ -687,11 +710,13 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap();
 
                         for output in op.0.derivation.outputs {
-                            let output_store_path: &[u8] = &output.1.store_path.as_ref()[1..];
+                            let output_store_path = output.1.store_path.0.to_string().unwrap();
+                            let output_store_path_without_slash: &[u8] =
+                                &output.1.store_path.as_ref()[1..];
                             let info = if let Some(dir) = action_result
                                 .output_directories
                                 .iter()
-                                .find(|d| d.path.as_bytes() == output_store_path)
+                                .find(|d| d.path.as_bytes() == output_store_path_without_slash)
                             {
                                 path_info_from_tree(
                                     &mut bs_client,
@@ -702,17 +727,44 @@ async fn main() -> anyhow::Result<()> {
                                 let file = action_result
                                     .output_files
                                     .iter()
-                                    .find(|f| f.path.as_bytes() == output_store_path)
+                                    .find(|f| f.path.as_bytes() == output_store_path_without_slash)
                                     .unwrap();
                                 PathInfo::File {
                                     digest: file.digest.clone().unwrap(),
                                     executable: file.is_executable,
                                 }
                             };
+                            let metadata_blob = download_blob(&mut bs_client, metadata_digest)
+                                .await
+                                .unwrap();
+                            let metadata: BuildMetadata =
+                                bincode::deserialize(&metadata_blob).unwrap();
+                            dbg!(&metadata);
+
+                            let OutputMetadata {
+                                references,
+                                nar_hash,
+                                nar_size,
+                            } = metadata.metadata.get(&output.1.store_path.0).unwrap();
+
+                            let valid_path_info = ValidPathInfo {
+                                deriver: op.0.store_path.clone(),
+                                hash: NarHash::from_bytes(nar_hash.as_ref()),
+                                references: StorePathSet {
+                                    paths: references.clone(),
+                                },
+                                registration_time: stop_time.seconds as u64,
+                                nar_size: *nar_size as u64,
+                                ultimate: true,
+                                sigs: nix_remote::StringSet { paths: vec![] },
+                                content_address: NixString::default(),
+                            };
+
                             add_store_path(
                                 &mut ac_client,
                                 &mut bs_client,
-                                output.1.store_path.0.to_string().unwrap(),
+                                output_store_path.clone(),
+                                valid_path_info,
                                 info.clone(),
                             )
                             .await?;
@@ -784,6 +836,7 @@ async fn main() -> anyhow::Result<()> {
                 panic!("ignoring op");
             }
         }
+        eprintln!("done with op");
     }
 
     Ok(())

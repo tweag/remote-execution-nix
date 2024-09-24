@@ -18,7 +18,7 @@ chmod -R +w $TEST_ROOT/local || true
 
 nix build -L -v -o result --max-jobs 0 \
  --builders-use-substitutes \
- .#test-slow \
+ .#test \
  --store $TEST_ROOT/local \
  --builders "$builder" --impure
 

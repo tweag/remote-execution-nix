@@ -81,7 +81,7 @@
             echo not the current time > $out
             chmod +x $out
             echo "on stdout and sleeping"
-            sleep 60
+            sleep 5
             echo "Done sleeping"
           '';
         };
