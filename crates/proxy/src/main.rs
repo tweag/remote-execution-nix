@@ -1,9 +1,4 @@
 // TODO:
-// - register built paths also. Don't forget to wrap in nix/store/... *in progress*
-//   it looks like we'd need to upload all directory struct referred to in the output tree into the CAS to be able to construct a valid input root for dependent actions. This seems very weird and we suspect that we're missing something about the protocol.
-//   there's now a output_directory_format field in Command messages which may solve this problem. We need to regenerate the protobuf files
-
-// TODO:
 // - write a EntrySink impl for nix.write somehow, this will facilitate some streaming
 // - basic sending of the nar tree works, but we aren't streaming from or to nix
 // - (bonus: pack small files into batch requests)
@@ -537,9 +532,6 @@ async fn main() -> anyhow::Result<()> {
     nix.write.inner.write_nix(&stderr::Msg::Last(()))?;
     nix.write.inner.flush()?;
 
-    // TODO: get rid of this altogether in favor of the action cache
-    let mut built_paths: HashMap<StorePath, BuiltPath> = HashMap::new();
-
     while let Some(op) = nix.next_op()? {
         eprintln!("read op {op:?}");
         match op {
@@ -768,15 +760,6 @@ async fn main() -> anyhow::Result<()> {
                                 info.clone(),
                             )
                             .await?;
-                            built_paths.insert(
-                                StorePath(output.1.store_path.0.clone()),
-                                BuiltPath {
-                                    deriver: op.0.store_path.clone(),
-                                    info,
-                                    registration_time: stop_time.seconds as u64,
-                                    build_metadata: metadata_digest.clone(),
-                                },
-                            );
                         }
 
                         let resp = BuildResult {
@@ -803,7 +786,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             WorkerOp::NarFromPath(op, _resp) => {
-                let BuiltPath { info, .. } = built_paths.get(&op).unwrap();
+                let found_paths = lookup_store_paths(
+                    &mut bs_client,
+                    &mut cas_client,
+                    &mut ac_client,
+                    &[op.clone().0],
+                )
+                .await?;
+
+                let info = &found_paths.get(&op).unwrap().0;
 
                 let nar = match info {
                     PathInfo::File { executable, digest } => {

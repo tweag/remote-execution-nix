@@ -23,7 +23,7 @@
         ];
       in
       with pkgs;
-      {
+      rec {
         devShells.default = mkShell {
           buildInputs = [
             rust-toolchain
@@ -83,6 +83,31 @@
             echo "on stdout and sleeping"
             sleep 5
             echo "Done sleeping"
+          '';
+        };
+
+        packages.test-deps = pkgs.stdenv.mkDerivation {
+          pname = "test-deps";
+          version = "0.0.1";
+          dontUnpack = true;
+
+          installPhase = ''
+            mkdir -p "$out"
+            echo 'hello' > $out/hello.txt
+          '';
+
+        };
+
+        
+        packages.test-depends = pkgs.stdenv.mkDerivation {
+          pname = "test-depends";
+          version = "0.0.1";
+          dontUnpack = true;
+
+          installPhase = ''
+            mkdir -p "$out"
+            cat "${packages.test-deps}/hello.txt" > $out/hello.txt
+            echo ' deps' >> $out/hello.txt
           '';
         };
       }
